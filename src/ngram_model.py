@@ -43,3 +43,47 @@ class NGramModel:
     def predict_next(self, context: List[str], top_k: int = TOP_K) -> List[Tuple[str, float]]:
         """Predict next tokens given context.
 
+        Returns:
+            List of (token, probability) sorted descending.
+        """
+        if not self._is_fitted:
+            return [("<UNK>", 0.0)]
+
+        ctx = tuple(context[-(self.n-1):]) if self.n > 1 else ()
+        candidates = Counter()
+        for ngram, count in self._ngram_counts.items():
+            if ngram[:-1] == ctx:
+                candidates[ngram[-1]] += count
+
+        if not candidates:
+            # Backoff: try shorter context
+            if len(ctx) > 0:
+                return self.predict_next(list(ctx[1:]), top_k)
+            # Unigram fallback
+            unigrams = Counter(t[-1] for t in self._ngram_counts if len(t) == 1)
+            total = sum(unigrams.values()) or 1
+            return [(w, c/total) for w, c in unigrams.most_common(top_k)]
+
+        total = sum(candidates.values())
+        results = [(w, c / total) for w, c in candidates.most_common(top_k)]
+        return results
+
+    def perplexity(self, tokens: List[str]) -> float:
+        """Compute perplexity on a token sequence."""
+        if not self._is_fitted:
+            return float("inf")
+        log_prob = 0.0
+        count = 0
+        for i in range(self.n - 1, len(tokens)):
+            ctx = tokens[i - self.n + 1:i]
+            preds = self.predict_next(ctx)
+            token = tokens[i]
+            prob = next((p for w, p in preds if w == token), 1e-10)
+            log_prob += log(prob)
+            count += 1
+        avg = log_prob / max(count, 1)
+        return np.exp(-avg)
+
+    @property
+    def vocab_size(self) -> int:
+        return self._vocab_size
