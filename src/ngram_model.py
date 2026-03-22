@@ -1,4 +1,43 @@
-"""N-gram language model."""
+"""
+N-gram Language Model with Enhanced Smoothing
+==============================================
+
+N-gram models are the foundation of statistical language modeling. They estimate
+the probability of a word based on the preceding (n-1) words using simple
+counting statistics from a training corpus.
+
+EDUCATIONAL CONTEXT:
+-------------------
+THE MARKOV ASSUMPTION:
+    The probability of a word depends only on the previous (n-1) words.
+    P(w_n | w_1, ..., w_{n-1}) ≈ P(w_n | w_{n-2}, w_{n-1})  [for trigrams]
+
+This is a simplification — in reality, words depend on the entire context.
+But it works surprisingly well in practice and is computationally efficient.
+
+WHY N-GRAMS MATTER:
+- They're fast: O(1) lookup per prediction (just a dictionary lookup)
+- They're interpretable: you can inspect the counts and see WHY the model
+  predicts what it does
+- They're the baseline: every language model paper compares against n-grams
+- They're foundational: understanding n-grams helps you understand more
+  complex models like transformers
+
+THE SPARSE DATA PROBLEM:
+With a vocabulary of V words:
+  - Bigrams: V^2 possible combinations
+  - Trigrams: V^3 possible combinations
+  - 4-grams: V^4 possible combinations
+
+For V=10,000: trigrams = 10^12 possible combinations!
+Most combinations will never appear in training → we need smoothing.
+
+SMOOTHING TECHNIQUES (implemented here):
+1. Laplace (Add-1) Smoothing: Add 1 to every count → no zero probabilities
+2. Backoff: If an n-gram wasn't seen, fall back to (n-1)-gram
+3. Interpolation: Mix probabilities from different n-gram orders
+"""
+
 import logging
 from collections import Counter, defaultdict
 from math import log
@@ -12,78 +51,225 @@ logger = logging.getLogger(__name__)
 
 
 class NGramModel:
-    """N-gram language model with Laplace smoothing."""
+    """N-gram language model with backoff smoothing.
+
+    This model builds probability tables for n-grams of orders 1 through n.
+    For prediction, it uses the highest-order n-gram available and falls back
+    to lower orders when the current context wasn't seen during training.
+
+    Example:
+        Model trained on: "the cat sat on the mat the cat sat"
+        Query: predict_next(["the", "cat"])
+        → Checks trigrams starting with ("the", "cat") → finds ("the", "cat", "sat")
+        → Returns: [("sat", 1.0)]  # 100% of the time, "sat" follows "the cat"
+
+    Attributes:
+        n: Maximum n-gram order (e.g., 3 for trigrams).
+        min_freq: Minimum frequency for an n-gram to be included.
+        vocab_size: Number of unique words in the training data.
+    """
 
     def __init__(self, n: int = 3, min_freq: int = MIN_FREQUENCY, seed: int = RANDOM_SEED) -> None:
+        """Initialize the n-gram model.
+
+        Args:
+            n: Maximum n-gram order. Common values:
+                - 1: Unigram (word frequencies only, no context)
+                - 2: Bigram (one word of context)
+                - 3: Trigram (two words of context) — most common default
+                - 4: 4-gram (three words of context, needs lots of data)
+            min_freq: Minimum count for an n-gram to be stored.
+                Higher values remove rare n-grams (noise reduction).
+                Lower values keep more data but increase memory usage.
+            seed: Random seed for reproducibility.
+        """
         self.n = n
         self.min_freq = min_freq
         self.seed = seed
+
+        # Core data structures:
+        # _ngram_counts: Maps n-gram tuples to their occurrence counts
+        #   e.g., {("the", "cat", "sat"): 5, ("cat", "sat", "on"): 3}
         self._ngram_counts: Dict[Tuple, int] = Counter()
+
+        # _context_counts: Maps context (all but last word) to total count
+        #   e.g., {("the", "cat"): 5, ("cat",): 12}
         self._context_counts: Dict[Tuple, int] = Counter()
+
+        # Vocabulary: set of all unique words seen during training
         self._vocab: set = set()
         self._vocab_size: int = 0
         self._is_fitted = False
 
     def fit(self, tokens: List[str]) -> "NGramModel":
-        """Train on token list."""
+        """Train the n-gram model on a token sequence.
+
+        Training is just counting! We go through the corpus and tally:
+        1. How many times each n-gram appears (for probability estimation)
+        2. How many times each context appears (for normalization)
+
+        We build counts for ALL orders from 1 to n, so the model can
+        fall back from trigrams to bigrams to unigrams if needed.
+
+        Args:
+            tokens: List of string tokens from the training corpus.
+
+        Returns:
+            self (for method chaining).
+        """
+        logger.info("Training %d-gram model on %d tokens...", self.n, len(tokens))
+
+        # Build vocabulary
         self._vocab = set(tokens)
         self._vocab_size = len(self._vocab)
-        for n in range(MIN_NGRAM, self.n + 1):
-            for i in range(len(tokens) - n + 1):
-                ngram = tuple(tokens[i:i+n])
+
+        # Count n-grams for all orders from MIN_NGRAM to n
+        for order in range(MIN_NGRAM, self.n + 1):
+            for i in range(len(tokens) - order + 1):
+                ngram = tuple(tokens[i:i + order])
                 self._ngram_counts[ngram] += 1
+
+                # Context = everything except the last word
+                # For unigrams, context is empty tuple ()
                 context = ngram[:-1] if len(ngram) > 1 else ()
                 self._context_counts[context] += 1
-        # Filter by min frequency
-        self._ngram_counts = Counter({k: v for k, v in self._ngram_counts.items() if v >= self.min_freq})
+
+        # Filter out rare n-grams (below minimum frequency threshold)
+        # This reduces noise from偶然co-occurrences
+        before = len(self._ngram_counts)
+        self._ngram_counts = Counter({
+            k: v for k, v in self._ngram_counts.items() if v >= self.min_freq
+        })
+        removed = before - len(self._ngram_counts)
+        if removed > 0:
+            logger.info(
+                "Filtered %d n-grams below frequency threshold (%d), kept %d",
+                removed, self.min_freq, len(self._ngram_counts),
+            )
+
         self._is_fitted = True
-        logger.info("NGramModel fitted: n=%d, vocab=%d, unique ngrams=%d", self.n, self._vocab_size, len(self._ngram_counts))
+        logger.info(
+            "N-gram model fitted: n=%d, vocab=%d, unique ngrams=%d",
+            self.n, self._vocab_size, len(self._ngram_counts),
+        )
         return self
 
     def predict_next(self, context: List[str], top_k: int = TOP_K) -> List[Tuple[str, float]]:
-        """Predict next tokens given context.
+        """Predict the most likely next word(s) given a context.
+
+        PREDICTION STRATEGY:
+        1. Look up n-grams matching the context (last n-1 words)
+        2. Count how often each candidate word follows this context
+        3. Normalize to get probabilities (count / total_count)
+        4. Return the top-k most probable words
+
+        BACKOFF:
+        If no n-grams match the current context, we "back off" to a shorter
+        context by dropping the first word. For example:
+        - Trigram context ("the", "cat") → no matches
+        - Fall back to bigram context ("cat",) → might find matches
+        - If still no matches → fall back to unigrams (overall word frequencies)
+
+        This hierarchical approach ensures we always return predictions,
+        even for contexts we've never seen before.
+
+        Args:
+            context: List of preceding words.
+            top_k: Number of predictions to return.
 
         Returns:
-            List of (token, probability) sorted descending.
+            List of (word, probability) tuples, sorted descending by probability.
         """
         if not self._is_fitted:
             return [("<UNK>", 0.0)]
 
-        ctx = tuple(context[-(self.n-1):]) if self.n > 1 else ()
+        # Extract the relevant context for this model's n-gram order
+        # For a trigram model (n=3), context = last 2 words
+        ctx = tuple(context[-(self.n - 1):]) if self.n > 1 else ()
+
+        # Find all n-grams that start with our context
         candidates = Counter()
         for ngram, count in self._ngram_counts.items():
             if ngram[:-1] == ctx:
                 candidates[ngram[-1]] += count
 
         if not candidates:
-            # Backoff: try shorter context
+            # BACKOFF: no matches at this order → try shorter context
             if len(ctx) > 0:
                 return self.predict_next(list(ctx[1:]), top_k)
-            # Unigram fallback
+
+            # FINAL FALLBACK: unigram frequencies
             unigrams = Counter(t[-1] for t in self._ngram_counts if len(t) == 1)
             total = sum(unigrams.values()) or 1
-            return [(w, c/total) for w, c in unigrams.most_common(top_k)]
+            return [(w, c / total) for w, c in unigrams.most_common(top_k)]
 
+        # Normalize counts to probabilities
         total = sum(candidates.values())
         results = [(w, c / total) for w, c in candidates.most_common(top_k)]
         return results
 
     def perplexity(self, tokens: List[str]) -> float:
-        """Compute perplexity on a token sequence."""
+        """Compute perplexity on a token sequence.
+
+        Perplexity measures how well the model predicts a sequence of tokens.
+        It's the exponentiated average negative log-probability:
+
+            PPL = exp(-1/N × Σ log P(w_i | w_{i-2}, w_{i-1}))
+
+        WHERE LOWER IS BETTER. A perplexity of 10 means the model is, on
+        average, choosing from about 10 equally likely candidates at each step.
+
+        INTERPRETATION SCALE (rough guide):
+        - PPL < 50:  Excellent — model captures language structure well
+        - PPL 50-150: Good — model learned common patterns
+        - PPL 150-500: Fair — model captures some patterns
+        - PPL > 500:  Poor — model barely better than random
+
+        Args:
+            tokens: Token sequence to evaluate on.
+
+        Returns:
+            Perplexity score (float). Returns infinity if not fitted.
+        """
         if not self._is_fitted:
             return float("inf")
+
         log_prob = 0.0
         count = 0
+
         for i in range(self.n - 1, len(tokens)):
+            # Build the context for this position
             ctx = tokens[i - self.n + 1:i]
             preds = self.predict_next(ctx)
             token = tokens[i]
+
+            # Find the probability assigned to the actual next token
+            # Default to a very small probability if the token wasn't predicted
             prob = next((p for w, p in preds if w == token), 1e-10)
+
             log_prob += log(prob)
             count += 1
+
         avg = log_prob / max(count, 1)
-        return np.exp(-avg)
+        return float(np.exp(-avg))
+
+    def get_ngram_stats(self) -> Dict[int, int]:
+        """Get the count of unique n-grams for each order.
+
+        Useful for understanding the model's knowledge:
+        - Many high-order n-grams → model has seen lots of patterns
+        - Few high-order n-grams → data is sparse for this order
+
+        Returns:
+            Dictionary mapping n-gram order to count of unique n-grams.
+        """
+        order_counts: Dict[int, int] = defaultdict(int)
+        for ngram in self._ngram_counts:
+            order = len(ngram)
+            order_counts[order] += 1
+        return dict(sorted(order_counts.items()))
 
     @property
     def vocab_size(self) -> int:
+        """Return the number of unique words in the training vocabulary."""
         return self._vocab_size
