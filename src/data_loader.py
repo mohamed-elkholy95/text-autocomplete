@@ -112,6 +112,84 @@ def load_sample_data() -> str:
     return " ".join(SAMPLE_TEXTS * 5)
 
 
+def load_corpus_from_file(path: str, encoding: str = "utf-8") -> str:
+    """Load a text corpus from a file on disk.
+
+    USE THIS FOR REAL-WORLD DATA:
+    The sample corpus (SAMPLE_TEXTS) is great for demos and testing, but
+    real projects need real data. This function loads plain text files
+    and handles common issues like encoding errors and empty files.
+
+    RECOMMENDED CORPORA (free and commonly used):
+    - Project Gutenberg: books in the public domain (gutenberg.org)
+    - Wikipedia dumps: encyclopedic text (dumps.wikimedia.org)
+    - Brown Corpus: 1 million words of American English (via NLTK)
+    - WikiText-103: preprocessed Wikipedia articles (research standard)
+
+    Args:
+        path: Path to a text file (.txt, .md, .csv — any plain text).
+        encoding: Text encoding (default UTF-8, use 'latin-1' for older files).
+
+    Returns:
+        File contents as a string.
+
+    Raises:
+        FileNotFoundError: If the file doesn't exist.
+        ValueError: If the file is empty after reading.
+    """
+    file_path = Path(path)
+    if not file_path.exists():
+        raise FileNotFoundError(f"Corpus file not found: {path}")
+
+    text = file_path.read_text(encoding=encoding)
+
+    if not text.strip():
+        raise ValueError(f"Corpus file is empty: {path}")
+
+    logger.info("Loaded corpus from %s: %d characters", path, len(text))
+    return text
+
+
+def normalize_text(text: str) -> str:
+    """Apply text normalization before tokenization.
+
+    TEXT NORMALIZATION:
+    Raw text from the wild contains inconsistencies that hurt model quality:
+    - Mixed case: "Machine" vs "machine" vs "MACHINE"
+    - Unicode variants: "café" vs "cafe\u0301" (combining accent)
+    - Extra whitespace: "the  cat   sat"
+    - Special characters: smart quotes, em dashes, etc.
+
+    This function standardizes text so the model sees consistent input.
+
+    Args:
+        text: Raw input text.
+
+    Returns:
+        Normalized text string.
+    """
+    import unicodedata
+
+    # Normalize Unicode (NFC form — composed characters)
+    text = unicodedata.normalize("NFC", text)
+
+    # Replace common Unicode punctuation with ASCII equivalents
+    replacements = {
+        "\u2018": "'", "\u2019": "'",   # Smart single quotes
+        "\u201c": '"', "\u201d": '"',   # Smart double quotes
+        "\u2013": "-", "\u2014": "-",   # En/em dashes
+        "\u2026": "...",                 # Ellipsis
+        "\u00a0": " ",                  # Non-breaking space
+    }
+    for old, new in replacements.items():
+        text = text.replace(old, new)
+
+    # Collapse multiple whitespace into single spaces
+    text = re.sub(r"\s+", " ", text).strip()
+
+    return text
+
+
 def tokenize(text: str, remove_stopwords: bool = False) -> List[str]:
     """Convert text into a list of tokens.
 
