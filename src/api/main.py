@@ -407,6 +407,75 @@ async def list_models():
     }
 
 
+class GenerateRequest(BaseModel):
+    """Request body for text generation endpoint."""
+    start_word: Optional[str] = Field(
+        default=None,
+        description="Word to start generation from. If omitted, picks a common starting word.",
+    )
+    max_length: int = Field(
+        default=20,
+        ge=1,
+        le=100,
+        description="Maximum number of words to generate.",
+    )
+    temperature: float = Field(
+        default=1.0,
+        ge=0.1,
+        le=3.0,
+        description="Sampling temperature: <1.0 = focused, 1.0 = natural, >1.0 = creative.",
+    )
+    seed: Optional[int] = Field(
+        default=None,
+        description="Random seed for reproducible generation.",
+    )
+
+
+class GenerateResponse(BaseModel):
+    """Response body for text generation."""
+    text: str = Field(..., description="Generated text.")
+    word_count: int = Field(..., description="Number of words generated.")
+    temperature: float = Field(..., description="Temperature used for generation.")
+    model: str = Field(default="markov", description="Model used for generation.")
+
+
+@app.post("/generate", response_model=GenerateResponse)
+async def generate_text(req: GenerateRequest):
+    """Generate text using the Markov chain model.
+
+    TEXT GENERATION is a natural extension of autocomplete — instead of
+    predicting ONE next word, we iteratively predict many words to produce
+    coherent (or creative) text passages.
+
+    The temperature parameter controls the randomness:
+    - 0.1: Very deterministic, repeats common patterns
+    - 1.0: Natural diversity, balanced between common and rare words
+    - 2.0+: Wild and creative, may produce unusual word combinations
+
+    Try it: generate with temperature=0.3 vs temperature=2.0 and compare!
+
+    Args:
+        req: GenerateRequest with start_word, max_length, and temperature.
+
+    Returns:
+        GenerateResponse with the generated text and metadata.
+    """
+    model = _get_trained_markov()
+    text = model.generate_text(
+        start_word=req.start_word,
+        max_length=req.max_length,
+        temperature=req.temperature,
+        seed=req.seed,
+    )
+
+    return GenerateResponse(
+        text=text,
+        word_count=len(text.split()),
+        temperature=req.temperature,
+        model="markov",
+    )
+
+
 @app.get("/metrics")
 async def metrics():
     """Get API usage metrics.
