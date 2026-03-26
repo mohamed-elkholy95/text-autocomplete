@@ -5,7 +5,7 @@
 **N-gram, Markov Chain & Beam Search language models** for text completion with perplexity evaluation
 
 [![Python](https://img.shields.io/badge/Python-3.12-3776AB?style=flat-square&logo=python)](https://python.org)
-[![Tests](https://img.shields.io/badge/Tests-60%2B%20passed-success?style=flat-square)](#)
+[![Tests](https://img.shields.io/badge/Tests-77%2B%20passed-success?style=flat-square)](#)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.100-009688?style=flat-square)](https://fastapi.tiangolo.com)
 [![Streamlit](https://img.shields.io/badge/Streamlit-1.28-FF4B4B?style=flat-square)](https://streamlit.io)
 
@@ -54,6 +54,28 @@ python -m pytest tests/ -v
 streamlit run streamlit_app/app.py
 ```
 
+## CLI Usage
+
+The project includes a full command-line interface for training, prediction, and evaluation:
+
+```bash
+# Train and save an n-gram model
+python cli.py train --model ngram --n 3 --save models/ngram_3.json --eval
+
+# Get autocomplete predictions
+python cli.py predict --text "machine learning is" --top-k 5
+python cli.py predict --text "neural networks" --model markov
+
+# Load a saved model for faster predictions
+python cli.py predict --text "deep learning" --load models/ngram_3.json
+
+# Run full evaluation comparing both models
+python cli.py eval --test-ratio 0.2
+
+# View corpus statistics and word frequencies
+python cli.py info
+```
+
 ## Project Structure
 
 ```
@@ -81,9 +103,12 @@ text-autocomplete/
 │   ├── test_neural.py
 │   ├── test_data_loader.py
 │   ├── test_evaluation.py
-│   └── test_api.py
+│   ├── test_api.py
+│   └── test_integration.py   # End-to-end pipeline tests
+├── cli.py                     # Command-line interface
 ├── docs/
-│   └── ARCHITECTURE.md
+│   ├── ARCHITECTURE.md        # System design & diagrams
+│   └── GLOSSARY.md            # NLP terminology reference
 ├── requirements.txt
 └── README.md
 ```
@@ -154,17 +179,27 @@ resp = requests.post("http://localhost:8010/autocomplete/batch", json={
     "model": "markov"
 })
 
+# Generate text with temperature control
+resp = requests.post("http://localhost:8010/generate", json={
+    "start_word": "machine",
+    "max_length": 20,
+    "temperature": 1.2  # Higher = more creative
+})
+
 # List available models
 resp = requests.get("http://localhost:8010/models")
 
 # Vocabulary statistics
 resp = requests.get("http://localhost:8010/vocab/stats")
+
+# API metrics (request counts, rate limit stats)
+resp = requests.get("http://localhost:8010/metrics")
 ```
 
 ## Running Tests
 
 ```bash
-# All tests
+# All tests (77+ across 8 test files)
 python -m pytest tests/ -v
 
 # Specific test file
