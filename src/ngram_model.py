@@ -208,6 +208,90 @@ class NGramModel:
         results = [(w, c / total) for w, c in candidates.most_common(top_k)]
         return results
 
+    def predict_next_interpolated(
+        self, context: List[str], top_k: int = TOP_K, lambdas: Optional[List[float]] = None,
+    ) -> List[Tuple[str, float]]:
+        """Predict next word using interpolation across all n-gram orders.
+
+        INTERPOLATION vs BACKOFF:
+        Backoff only uses lower-order models when higher-order ones fail.
+        Interpolation ALWAYS combines all orders, weighted by lambda values.
+
+        The interpolated probability is:
+            P_interp(w|context) = λ₁·P_unigram(w) + λ₂·P_bigram(w|w₋₁) + λ₃·P_trigram(w|w₋₂,w₋₁)
+
+        WHY INTERPOLATION IS BETTER:
+        - Backoff is all-or-nothing: it ignores lower-order information when
+          the higher-order context exists, even if it's unreliable (low count)
+        - Interpolation hedges its bets: even if the trigram count is 1
+          (unreliable), it still considers the more robust bigram and unigram
+        - In practice, interpolation often beats backoff, especially on
+          smaller datasets where higher-order counts are sparse
+
+        SETTING LAMBDAS:
+        - Equal weights [0.33, 0.33, 0.33]: treats all orders equally
+        - Higher weight on higher orders [0.1, 0.3, 0.6]: trusts context more
+        - The optimal lambdas can be learned from a held-out validation set
+          using the Expectation-Maximization (EM) algorithm
+
+        Args:
+            context: List of preceding words.
+            top_k: Number of predictions to return.
+            lambdas: Interpolation weights for each order (1 to n).
+                Must sum to 1.0 and have length n. If None, uses equal weights.
+
+        Returns:
+            List of (word, probability) tuples sorted by probability descending.
+        """
+        if not self._is_fitted:
+            return [("<UNK>", 0.0)]
+
+        # Default: equal weights across all n-gram orders
+        if lambdas is None:
+            lambdas = [1.0 / self.n] * self.n
+
+        if len(lambdas) != self.n or abs(sum(lambdas) - 1.0) > 1e-6:
+            raise ValueError(
+                f"lambdas must have length {self.n} and sum to 1.0, "
+                f"got length {len(lambdas)} summing to {sum(lambdas):.4f}"
+            )
+
+        # Collect interpolated probabilities for all vocabulary words
+        interpolated: Dict[str, float] = {}
+
+        for word in self._vocab:
+            prob = 0.0
+
+            for order_idx in range(self.n):
+                order = order_idx + 1  # 1-gram, 2-gram, ..., n-gram
+                lam = lambdas[order_idx]
+
+                if order == 1:
+                    # Unigram probability: count(word) / total_count
+                    unigram_key = (word,)
+                    count = self._ngram_counts.get(unigram_key, 0)
+                    total = self._context_counts.get((), 0)
+                    p = count / total if total > 0 else 0.0
+                else:
+                    # Higher-order: P(word | last (order-1) context words)
+                    ctx = tuple(context[-(order - 1):]) if len(context) >= order - 1 else tuple(context)
+                    if len(ctx) < order - 1:
+                        p = 0.0
+                    else:
+                        ngram_key = ctx + (word,)
+                        count = self._ngram_counts.get(ngram_key, 0)
+                        ctx_count = self._context_counts.get(ctx, 0)
+                        p = count / ctx_count if ctx_count > 0 else 0.0
+
+                prob += lam * p
+
+            if prob > 0:
+                interpolated[word] = prob
+
+        # Sort by probability and return top-k
+        sorted_preds = sorted(interpolated.items(), key=lambda x: x[1], reverse=True)
+        return sorted_preds[:top_k]
+
     def perplexity(self, tokens: List[str]) -> float:
         """Compute perplexity on a token sequence.
 
