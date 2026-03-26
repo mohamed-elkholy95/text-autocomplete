@@ -28,10 +28,13 @@ ARCHITECTURE:
 """
 
 import logging
+import time
+from collections import defaultdict
 from typing import Dict, List, Optional
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from src.config import API_TITLE, API_VERSION, TOP_K
@@ -60,6 +63,63 @@ app = FastAPI(
     """,
 )
 
+# ---------------------------------------------------------------------------
+# Rate Limiting — Token Bucket Algorithm
+# ---------------------------------------------------------------------------
+# Rate limiting prevents abuse and ensures fair access. We use a simple
+# in-memory token bucket per client IP. In production, you'd use Redis
+# or a dedicated rate limiter like slowapi.
+#
+# TOKEN BUCKET ALGORITHM:
+# - Each client has a "bucket" that holds up to MAX_TOKENS tokens
+# - Each request consumes one token
+# - Tokens are refilled at REFILL_RATE per second
+# - If the bucket is empty, the request is rejected with HTTP 429
+#
+# This is the same algorithm used by AWS API Gateway, Stripe, and
+# most cloud rate limiters. It's simple, memory-efficient, and allows
+# short bursts while enforcing long-term rate limits.
+
+RATE_LIMIT_MAX_TOKENS = 30      # Maximum burst size
+RATE_LIMIT_REFILL_RATE = 2.0    # Tokens added per second
+
+_rate_buckets: Dict[str, Dict] = defaultdict(
+    lambda: {"tokens": RATE_LIMIT_MAX_TOKENS, "last_refill": time.monotonic()}
+)
+
+
+def _check_rate_limit(client_ip: str) -> bool:
+    """Check if a client has remaining rate limit tokens.
+
+    Returns True if the request is allowed, False if rate-limited.
+    """
+    bucket = _rate_buckets[client_ip]
+    now = time.monotonic()
+
+    # Refill tokens based on elapsed time since last refill
+    elapsed = now - bucket["last_refill"]
+    bucket["tokens"] = min(
+        RATE_LIMIT_MAX_TOKENS,
+        bucket["tokens"] + elapsed * RATE_LIMIT_REFILL_RATE,
+    )
+    bucket["last_refill"] = now
+
+    # Consume a token if available
+    if bucket["tokens"] >= 1.0:
+        bucket["tokens"] -= 1.0
+        return True
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Request Metrics Tracking
+# ---------------------------------------------------------------------------
+# Simple in-memory metrics for monitoring API health. In production,
+# you'd use Prometheus, DataDog, or similar observability tools.
+
+_request_metrics: Dict[str, int] = defaultdict(int)
+
+
 # Enable CORS (Cross-Origin Resource Sharing) so web apps can call this API
 # from a different domain. The wildcard (*) allows all origins — in production,
 # you'd restrict this to your actual frontend domain.
@@ -69,6 +129,51 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def rate_limit_and_metrics_middleware(request: Request, call_next):
+    """Middleware that enforces rate limiting and tracks request metrics.
+
+    MIDDLEWARE EXPLAINED:
+    Middleware wraps every request/response cycle. It runs BEFORE the
+    endpoint handler (for rate limiting, auth, logging) and AFTER
+    (for response timing, error handling).
+
+    The execution order is:
+        Client → Middleware(before) → Endpoint → Middleware(after) → Client
+    """
+    # Extract client IP (X-Forwarded-For for proxied requests)
+    client_ip = request.headers.get("x-forwarded-for", request.client.host if request.client else "unknown")
+
+    # Rate limit check (skip health endpoint to allow monitoring)
+    if request.url.path != "/health" and not _check_rate_limit(client_ip):
+        _request_metrics["rate_limited"] += 1
+        logger.warning("Rate limited: %s on %s", client_ip, request.url.path)
+        return JSONResponse(
+            status_code=429,
+            content={"detail": "Rate limit exceeded. Please try again shortly."},
+        )
+
+    # Track request count per endpoint
+    _request_metrics[f"requests:{request.url.path}"] += 1
+    _request_metrics["total_requests"] += 1
+
+    # Time the request
+    start_time = time.perf_counter()
+    response = await call_next(request)
+    duration_ms = (time.perf_counter() - start_time) * 1000
+
+    # Log request details (structured logging for easy parsing)
+    logger.info(
+        "request: method=%s path=%s status=%d duration=%.1fms client=%s",
+        request.method, request.url.path, response.status_code,
+        duration_ms, client_ip,
+    )
+
+    # Add timing header (useful for debugging latency)
+    response.headers["X-Response-Time-Ms"] = f"{duration_ms:.1f}"
+    return response
 
 
 # ---------------------------------------------------------------------------
@@ -299,6 +404,25 @@ async def list_models():
                 "description": "First-order Markov chain with Laplace smoothing. Simple and effective for common word pairs.",
             },
         ]
+    }
+
+
+@app.get("/metrics")
+async def metrics():
+    """Get API usage metrics.
+
+    Returns request counts, rate limit hits, and endpoint-level breakdowns.
+    In production, these would feed into a monitoring dashboard (Grafana,
+    DataDog) for alerting on anomalies like sudden traffic spikes.
+    """
+    return {
+        "total_requests": _request_metrics.get("total_requests", 0),
+        "rate_limited": _request_metrics.get("rate_limited", 0),
+        "endpoints": {
+            k.split(":", 1)[1]: v
+            for k, v in _request_metrics.items()
+            if k.startswith("requests:")
+        },
     }
 
 
