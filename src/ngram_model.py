@@ -269,6 +269,97 @@ class NGramModel:
             order_counts[order] += 1
         return dict(sorted(order_counts.items()))
 
+    def save(self, path: str) -> None:
+        """Serialize the trained model to disk using JSON.
+
+        MODEL PERSISTENCE:
+        Saving a trained model means we don't have to retrain every time
+        we restart the application. For n-gram models, we save:
+        - The n-gram counts (our "learned parameters")
+        - The vocabulary and configuration
+
+        WHY JSON (not pickle)?
+        - JSON is human-readable — you can inspect what the model learned
+        - JSON is language-agnostic — other tools can read the model
+        - Pickle has security risks (arbitrary code execution on load)
+        - The model is just counts and strings — JSON handles this perfectly
+
+        Args:
+            path: File path to save the model to (e.g., "models/ngram_3.json").
+        """
+        import json
+        from pathlib import Path
+
+        if not self._is_fitted:
+            raise RuntimeError("Cannot save an untrained model. Call fit() first.")
+
+        # Convert tuple keys to strings for JSON serialization
+        # JSON only supports string keys, but our n-gram keys are tuples
+        # e.g., ("the", "cat") → "the||cat"
+        serialized_ngrams = {
+            "||".join(k): v for k, v in self._ngram_counts.items()
+        }
+        serialized_contexts = {
+            "||".join(k) if k else "": v for k, v in self._context_counts.items()
+        }
+
+        data = {
+            "model_type": "ngram",
+            "n": self.n,
+            "min_freq": self.min_freq,
+            "seed": self.seed,
+            "vocab": sorted(self._vocab),
+            "ngram_counts": serialized_ngrams,
+            "context_counts": serialized_contexts,
+        }
+
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+        logger.info("N-gram model saved to %s (%d n-grams)", path, len(self._ngram_counts))
+
+    @classmethod
+    def load(cls, path: str) -> "NGramModel":
+        """Load a previously saved n-gram model from disk.
+
+        This reconstructs the model exactly as it was when saved, including
+        all n-gram counts, vocabulary, and configuration. No retraining needed.
+
+        Args:
+            path: File path to load the model from.
+
+        Returns:
+            A fitted NGramModel instance ready for predictions.
+
+        Raises:
+            FileNotFoundError: If the model file doesn't exist.
+            ValueError: If the file doesn't contain a valid n-gram model.
+        """
+        import json
+
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        if data.get("model_type") != "ngram":
+            raise ValueError(f"Expected model_type 'ngram', got '{data.get('model_type')}'")
+
+        model = cls(n=data["n"], min_freq=data["min_freq"], seed=data["seed"])
+
+        # Reconstruct tuple keys from "word1||word2" strings
+        model._ngram_counts = Counter({
+            tuple(k.split("||")): v for k, v in data["ngram_counts"].items()
+        })
+        model._context_counts = Counter({
+            tuple(k.split("||")) if k else (): v
+            for k, v in data["context_counts"].items()
+        })
+        model._vocab = set(data["vocab"])
+        model._vocab_size = len(model._vocab)
+        model._is_fitted = True
+
+        logger.info("N-gram model loaded from %s (n=%d, vocab=%d)", path, model.n, model._vocab_size)
+        return model
+
     @property
     def vocab_size(self) -> int:
         """Return the number of unique words in the training vocabulary."""

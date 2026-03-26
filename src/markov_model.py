@@ -374,6 +374,82 @@ class MarkovChainModel:
         """Return the total number of word-to-word transitions observed."""
         return self._n_transitions
 
+    def save(self, path: str) -> None:
+        """Serialize the trained Markov chain to disk using JSON.
+
+        WHAT WE SAVE:
+        The transition counts (not probabilities) — so we can reconstruct
+        the exact same probability distribution on load, including the
+        smoothing parameter. Saving counts instead of probabilities also
+        means we could merge multiple saved models by adding their counts.
+
+        Args:
+            path: File path to save the model to.
+        """
+        import json
+        from pathlib import Path
+
+        if not self._is_fitted:
+            raise RuntimeError("Cannot save an untrained model. Call fit() first.")
+
+        data = {
+            "model_type": "markov",
+            "smoothing": self.smoothing,
+            "seed": self.seed,
+            "word_to_idx": self._word_to_idx,
+            "transitions": {
+                word: dict(counts) for word, counts in self._transitions.items()
+            },
+            "word_counts": dict(self._word_counts),
+            "start_words": dict(self._start_words),
+        }
+
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+        logger.info("Markov model saved to %s (vocab=%d)", path, self._vocab_size)
+
+    @classmethod
+    def load(cls, path: str) -> "MarkovChainModel":
+        """Load a previously saved Markov chain model from disk.
+
+        Reconstructs all internal state: transition counts, vocabulary mapping,
+        word frequencies, and sentence-starting words.
+
+        Args:
+            path: File path to load the model from.
+
+        Returns:
+            A fitted MarkovChainModel instance ready for predictions.
+
+        Raises:
+            FileNotFoundError: If the model file doesn't exist.
+            ValueError: If the file doesn't contain a valid Markov model.
+        """
+        import json
+
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        if data.get("model_type") != "markov":
+            raise ValueError(f"Expected model_type 'markov', got '{data.get('model_type')}'")
+
+        model = cls(smoothing=data["smoothing"], seed=data["seed"])
+        model._word_to_idx = data["word_to_idx"]
+        model._idx_to_word = {int(v): k for k, v in data["word_to_idx"].items()}
+        model._vocab_size = len(model._word_to_idx)
+
+        model._transitions = defaultdict(Counter, {
+            word: Counter(counts) for word, counts in data["transitions"].items()
+        })
+        model._word_counts = Counter(data["word_counts"])
+        model._start_words = Counter(data["start_words"])
+        model._n_transitions = sum(model._word_counts.values())
+        model._is_fitted = True
+
+        logger.info("Markov model loaded from %s (vocab=%d)", path, model._vocab_size)
+        return model
+
     def get_top_transitions(self, word: str, top_k: int = 10) -> List[Tuple[str, float]]:
         """Get the most likely words to follow a given word.
 
