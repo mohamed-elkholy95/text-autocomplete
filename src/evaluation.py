@@ -18,7 +18,7 @@ KEY METRICS:
 4. COVERAGE: What fraction of the vocabulary the model can predict.
 """
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 import logging
 
 import numpy as np
@@ -195,6 +195,75 @@ def generate_report(
         "- **Coverage**: Higher is better. Fraction of reference vocabulary the model can predict.",
     ]
     return "\n".join(lines)
+
+
+def prediction_confidence(predictions: List[Tuple[str, float]]) -> Dict[str, float]:
+    """Analyze the confidence level of a set of predictions.
+
+    CONFIDENCE ANALYSIS:
+    When an autocomplete system makes predictions, it's useful to know HOW
+    confident the model is — not just what it predicts. This helps with:
+    - UI decisions: show predictions only when confidence is high
+    - Model debugging: low confidence everywhere → undertrained model
+    - User experience: display confidence indicators (green/yellow/red)
+
+    We compute three confidence metrics:
+
+    1. TOP-1 PROBABILITY: How much probability mass is on the best prediction.
+       - High (>0.5): Model is very sure about the next word
+       - Low (<0.1): Model is uncertain, many words are roughly equally likely
+
+    2. ENTROPY: Measures the "spread" of the probability distribution.
+       - Low entropy: Predictions are concentrated (model is confident)
+       - High entropy: Predictions are spread out (model is uncertain)
+       - Maximum entropy = log2(k) where k is the number of predictions
+
+    3. MARGIN: Difference between top-1 and top-2 probabilities.
+       - Large margin: Clear winner — the top prediction stands out
+       - Small margin: Close race — the model can't decide between options
+
+    Args:
+        predictions: List of (word, probability) tuples from a model.
+
+    Returns:
+        Dictionary with confidence metrics:
+        - top1_prob: Probability of the best prediction
+        - entropy: Shannon entropy of the prediction distribution (bits)
+        - margin: Probability gap between #1 and #2 predictions
+        - confidence_level: Categorical label ("high", "medium", "low")
+    """
+    if not predictions:
+        return {
+            "top1_prob": 0.0,
+            "entropy": 0.0,
+            "margin": 0.0,
+            "confidence_level": "none",
+        }
+
+    probs = [p for _, p in predictions]
+    top1 = probs[0]
+
+    # Shannon entropy: H = -Σ p(x) × log2(p(x))
+    # Measures information content / uncertainty in the distribution
+    entropy = -sum(p * np.log2(p + 1e-10) for p in probs)
+
+    # Margin between top-1 and top-2
+    margin = probs[0] - probs[1] if len(probs) > 1 else probs[0]
+
+    # Categorical confidence level based on heuristic thresholds
+    if top1 > 0.5 or margin > 0.3:
+        level = "high"
+    elif top1 > 0.2 or margin > 0.1:
+        level = "medium"
+    else:
+        level = "low"
+
+    return {
+        "top1_prob": round(top1, 4),
+        "entropy": round(float(entropy), 4),
+        "margin": round(margin, 4),
+        "confidence_level": level,
+    }
 
 
 def compare_models(
