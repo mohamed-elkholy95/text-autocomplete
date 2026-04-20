@@ -40,12 +40,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from src.config import TOP_K, RANDOM_SEED
 from src.data_loader import (
     load_sample_data,
+    load_wikitext,
     tokenize,
     train_test_split,
     get_corpus_stats,
 )
 from src.ngram_model import NGramModel
 from src.markov_model import MarkovChainModel
+from src.transformer_model import HAS_TRANSFORMERS, TransformerModel
 from src.evaluation import (
     compute_perplexity,
     autocomplete_accuracy,
@@ -118,7 +120,16 @@ def cmd_predict(args: argparse.Namespace) -> None:
     Otherwise, it trains a fresh model on the sample corpus.
     """
     # Load or train model
-    if args.load:
+    if args.model == "transformer":
+        if not HAS_TRANSFORMERS:
+            print("❌ Transformer requires `transformers` to be installed.")
+            sys.exit(1)
+        if args.load:
+            print("⚠️  --load is ignored for transformer; weights come from HuggingFace.")
+        print("🤗 Loading SmolLM2-135M from HuggingFace...")
+        model = TransformerModel()
+        model.fit(tokenize(load_sample_data()))  # calibration + warmup
+    elif args.load:
         print(f"📂 Loading model from {args.load}...")
         if args.model == "ngram":
             model = NGramModel.load(args.load)
@@ -126,8 +137,7 @@ def cmd_predict(args: argparse.Namespace) -> None:
             model = MarkovChainModel.load(args.load)
     else:
         print(f"🔄 Training fresh {args.model} model...")
-        corpus = load_sample_data()
-        tokens = tokenize(corpus)
+        tokens = tokenize(load_sample_data())
         if args.model == "ngram":
             model = NGramModel(n=args.n or 3)
             model.fit(tokens)
@@ -299,8 +309,12 @@ Examples:
         help="Input text to complete",
     )
     pred_parser.add_argument(
-        "--model", choices=["ngram", "markov"], default="ngram",
-        help="Model type (default: ngram)",
+        "--model", choices=["ngram", "markov", "transformer"], default="ngram",
+        help=(
+            "Model type: 'ngram' (classical), 'markov' (1st-order), or "
+            "'transformer' (SmolLM2-135M from HuggingFace; returns BPE "
+            "subword pieces). Default: ngram."
+        ),
     )
     pred_parser.add_argument(
         "--n", type=int, default=3,

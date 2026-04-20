@@ -267,6 +267,54 @@ def _get_trained_markov():
     return _model_cache["markov"]
 
 
+def _get_trained_transformer():
+    """Get or create a cached SmolLM2-135M transformer baseline.
+
+    First call downloads the pretrained weights (~300MB) from the
+    HuggingFace Hub, then warms up CUDA kernels. Subsequent calls are
+    hits on the module-level cache. Returns None when the transformers
+    package is not installed so the endpoint can respond with 503
+    rather than crash.
+    """
+    if "transformer" not in _model_cache:
+        try:
+            from src.data_loader import tokenize, load_sample_data
+            from src.transformer_model import TransformerModel, HAS_TRANSFORMERS
+            if not HAS_TRANSFORMERS:
+                return None
+            model = TransformerModel()
+            model.fit(tokenize(load_sample_data()))
+            _model_cache["transformer"] = model
+            logger.info("Transformer model (SmolLM2-135M) loaded and cached")
+        except Exception as e:
+            logger.warning("Failed to load transformer model: %s", e)
+            return None
+    return _model_cache["transformer"]
+
+
+def _select_model(name: str):
+    """Resolve a model-name string to a cached, trained model instance.
+
+    Raises HTTPException(503) when the transformer is requested but
+    the transformers package is not installed, so the client gets a
+    structured error instead of a 500.
+    """
+    if name == "markov":
+        return _get_trained_markov()
+    if name == "transformer":
+        model = _get_trained_transformer()
+        if model is None:
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "Transformer model is unavailable — the `transformers` "
+                    "package is not installed in this environment."
+                ),
+            )
+        return model
+    return _get_trained_ngram()
+
+
 # ---------------------------------------------------------------------------
 # Request/Response Models (Pydantic)
 # ---------------------------------------------------------------------------
@@ -296,8 +344,12 @@ class AutocompleteRequest(BaseModel):
     )
     model: str = Field(
         default="ngram",
-        pattern="^(ngram|markov)$",
-        description="Language model to use: 'ngram' or 'markov'.",
+        pattern="^(ngram|markov|transformer)$",
+        description=(
+            "Language model to use: 'ngram' (classical, word-level), "
+            "'markov' (first-order transitions), or 'transformer' "
+            "(SmolLM2-135M; returns BPE subword pieces)."
+        ),
     )
 
 
@@ -328,7 +380,7 @@ class BatchRequest(BaseModel):
         ),
     )
     top_k: int = Field(default=5, ge=1, le=20)
-    model: str = Field(default="ngram", pattern="^(ngram|markov)$")
+    model: str = Field(default="ngram", pattern="^(ngram|markov|transformer)$")
 
 
 class BatchResponse(BaseModel):
@@ -378,11 +430,7 @@ async def autocomplete(req: AutocompleteRequest):
         # Empty after tokenization — can't make predictions
         raise HTTPException(status_code=400, detail="Text contains no valid tokens.")
 
-    # Select the model
-    if req.model == "markov":
-        model = _get_trained_markov()
-    else:
-        model = _get_trained_ngram()
+    model = _select_model(req.model)
 
     # Get predictions
     preds = model.predict_next(tokens, top_k=req.top_k)
@@ -420,10 +468,7 @@ async def autocomplete_batch(req: BatchRequest):
     results = []
 
     # Select the model once (shared across all texts)
-    if req.model == "markov":
-        model = _get_trained_markov()
-    else:
-        model = _get_trained_ngram()
+    model = _select_model(req.model)
 
     for text in req.texts:
         tokens = tokenize(text)
@@ -452,21 +497,33 @@ async def list_models():
     This endpoint helps API consumers discover what models are available
     and choose the right one for their use case.
     """
-    return {
-        "models": [
-            {
-                "id": "ngram",
-                "name": "N-gram Language Model",
-                "description": "Classic statistical model using word co-occurrence counts. Fast and interpretable.",
-                "max_ngram_order": 3,
-            },
-            {
-                "id": "markov",
-                "name": "Markov Chain Model",
-                "description": "First-order Markov chain with Laplace smoothing. Simple and effective for common word pairs.",
-            },
-        ]
-    }
+    from src.transformer_model import HAS_TRANSFORMERS, DEFAULT_MODEL_ID
+
+    models = [
+        {
+            "id": "ngram",
+            "name": "N-gram Language Model",
+            "description": "Classic statistical model using word co-occurrence counts. Fast and interpretable.",
+            "max_ngram_order": 3,
+        },
+        {
+            "id": "markov",
+            "name": "Markov Chain Model",
+            "description": "First-order Markov chain with Laplace smoothing. Simple and effective for common word pairs.",
+        },
+    ]
+    if HAS_TRANSFORMERS:
+        models.append({
+            "id": "transformer",
+            "name": f"Transformer ({DEFAULT_MODEL_ID})",
+            "description": (
+                "Pretrained causal LM (SmolLM2-135M, Apache-2.0). Returns "
+                "top-k BPE subword pieces, not always whole words — see "
+                "docs/ARCHITECTURE.md §3.2 for why this is a deliberate "
+                "teaching choice."
+            ),
+        })
+    return {"models": models}
 
 
 class GenerateRequest(BaseModel):

@@ -15,6 +15,7 @@ from src.data_loader import tokenize, load_sample_data
 from src.ngram_model import NGramModel
 from src.markov_model import MarkovChainModel
 from src.beam_search import BeamSearchDecoder
+from src.transformer_model import HAS_TRANSFORMERS, TransformerModel
 from src.config import TOP_K
 
 st.title("✍️ Interactive Autocomplete")
@@ -32,6 +33,20 @@ def load_models():
     markov.fit(tokens)
     return tokens, ngram, markov
 
+
+@st.cache_resource(show_spinner="Loading SmolLM2-135M (first call only)...")
+def load_transformer():
+    """Lazily load the SmolLM2-135M baseline. Cached across reruns.
+
+    Returns None when transformers isn't installed so the UI can degrade
+    gracefully rather than crash.
+    """
+    if not HAS_TRANSFORMERS:
+        return None
+    model = TransformerModel()
+    model.fit(tokenize(load_sample_data()))
+    return model
+
 all_tokens, ngram_model, markov_model = load_models()
 
 # ---------------------------------------------------------------------------
@@ -48,12 +63,25 @@ text = st.text_area(
 
 top_k = st.slider("Number of suggestions (top-k)", min_value=1, max_value=15, value=TOP_K)
 
+choices = ["N-gram (Trigram)", "Markov Chain"]
+if HAS_TRANSFORMERS:
+    choices.append("Transformer (SmolLM2-135M)")
 model_choice = st.radio(
     "Choose a model",
-    ["N-gram (Trigram)", "Markov Chain"],
+    choices,
     horizontal=True,
-    help="N-gram uses 2-word context, Markov uses 1-word context.",
+    help=(
+        "N-gram uses 2-word context, Markov uses 1-word context, "
+        "Transformer uses up to 1024 BPE subwords from a pretrained causal LM."
+    ),
 )
+
+if "Transformer" in model_choice:
+    st.info(
+        "ℹ️ SmolLM2 is a BPE-tokenized pretrained model. Suggestions may be "
+        "**subword pieces** (e.g. `ligence`) rather than whole words — this is "
+        "faithful to how the model sees text. First load downloads ~300MB."
+    )
 
 if st.button("🔮 Predict", type="primary", use_container_width=True):
     # Tokenize the input
@@ -63,7 +91,12 @@ if st.button("🔮 Predict", type="primary", use_container_width=True):
         st.error("Please enter some text to get predictions!")
     else:
         # Select model
-        if "Markov" in model_choice:
+        if "Transformer" in model_choice:
+            model = load_transformer()
+            if model is None:
+                st.error("Transformer unavailable — `transformers` package not installed.")
+                st.stop()
+        elif "Markov" in model_choice:
             model = markov_model
         else:
             model = ngram_model
