@@ -28,14 +28,15 @@ ARCHITECTURE:
 """
 
 import logging
+import os
 import time
 from collections import defaultdict
-from typing import Dict, List, Optional
+from typing import Annotated, Dict, List, Optional
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, StringConstraints
 
 from src.config import API_TITLE, API_VERSION, TOP_K
 
@@ -82,19 +83,47 @@ app = FastAPI(
 
 RATE_LIMIT_MAX_TOKENS = 30      # Maximum burst size
 RATE_LIMIT_REFILL_RATE = 2.0    # Tokens added per second
+# A bucket is evicted once it has been idle long enough to have fully
+# refilled twice over. Bounds memory growth under the spoofable-IP threat.
+RATE_LIMIT_BUCKET_TTL = (RATE_LIMIT_MAX_TOKENS / RATE_LIMIT_REFILL_RATE) * 2
+# Hard cap on the number of live buckets; beyond this we evict the oldest
+# first even if their TTL hasn't expired. Prevents a flood of unique IPs
+# from exhausting memory.
+RATE_LIMIT_MAX_BUCKETS = 10_000
 
-_rate_buckets: Dict[str, Dict] = defaultdict(
-    lambda: {"tokens": RATE_LIMIT_MAX_TOKENS, "last_refill": time.monotonic()}
-)
+_rate_buckets: Dict[str, Dict] = {}
 
 
 def _check_rate_limit(client_ip: str) -> bool:
     """Check if a client has remaining rate limit tokens.
 
-    Returns True if the request is allowed, False if rate-limited.
+    Returns True if the request is allowed, False if rate-limited. The
+    bucket table is pruned opportunistically so it can't grow without
+    bound when many unique client IPs hit the API.
     """
-    bucket = _rate_buckets[client_ip]
     now = time.monotonic()
+
+    # Opportunistic eviction: drop any bucket that's been idle past the
+    # TTL (i.e. would already be at full tokens again anyway).
+    if _rate_buckets:
+        stale = [
+            ip for ip, b in _rate_buckets.items()
+            if now - b["last_refill"] > RATE_LIMIT_BUCKET_TTL
+        ]
+        for ip in stale:
+            _rate_buckets.pop(ip, None)
+
+    # Hard cap: if we're still over the limit, drop the oldest buckets.
+    if len(_rate_buckets) >= RATE_LIMIT_MAX_BUCKETS:
+        for ip, _ in sorted(
+            _rate_buckets.items(), key=lambda kv: kv[1]["last_refill"]
+        )[: len(_rate_buckets) - RATE_LIMIT_MAX_BUCKETS + 1]:
+            _rate_buckets.pop(ip, None)
+
+    bucket = _rate_buckets.get(client_ip)
+    if bucket is None:
+        bucket = {"tokens": RATE_LIMIT_MAX_TOKENS, "last_refill": now}
+        _rate_buckets[client_ip] = bucket
 
     # Refill tokens based on elapsed time since last refill
     elapsed = now - bucket["last_refill"]
@@ -109,6 +138,33 @@ def _check_rate_limit(client_ip: str) -> bool:
         bucket["tokens"] -= 1.0
         return True
     return False
+
+
+# Only trust X-Forwarded-For when the deploy explicitly opts in (e.g. when
+# running behind a known reverse proxy). Otherwise we use the direct peer
+# address, which a client can't spoof in HTTP/1.1.
+TRUST_FORWARDED_HEADERS = os.getenv("TRUST_FORWARDED_HEADERS", "").lower() in (
+    "1", "true", "yes",
+)
+
+
+def _resolve_client_ip(request: Request) -> str:
+    """Resolve the client IP for rate-limit bucketing.
+
+    Defaults to ``request.client.host`` because the X-Forwarded-For header
+    is freely settable by any HTTP client and would otherwise let a caller
+    mint a fresh bucket per request. Operators that really do run behind a
+    trusted proxy can set ``TRUST_FORWARDED_HEADERS=1`` to honour the
+    first IP in the header chain.
+    """
+    if TRUST_FORWARDED_HEADERS:
+        xff = request.headers.get("x-forwarded-for")
+        if xff:
+            # Standard: the left-most entry is the original client.
+            first = xff.split(",")[0].strip()
+            if first:
+                return first
+    return request.client.host if request.client else "unknown"
 
 
 # ---------------------------------------------------------------------------
@@ -143,8 +199,8 @@ async def rate_limit_and_metrics_middleware(request: Request, call_next):
     The execution order is:
         Client → Middleware(before) → Endpoint → Middleware(after) → Client
     """
-    # Extract client IP (X-Forwarded-For for proxied requests)
-    client_ip = request.headers.get("x-forwarded-for", request.client.host if request.client else "unknown")
+    # Extract client IP (honours X-Forwarded-For only when explicitly trusted)
+    client_ip = _resolve_client_ip(request)
 
     # Rate limit check (skip health endpoint to allow monitoring)
     if request.url.path != "/health" and not _check_rate_limit(client_ip):
@@ -164,15 +220,16 @@ async def rate_limit_and_metrics_middleware(request: Request, call_next):
     response = await call_next(request)
     duration_ms = (time.perf_counter() - start_time) * 1000
 
-    # Log request details (structured logging for easy parsing)
+    # Stamp the timing header first so the logged line reflects what the
+    # client will actually see (matches the order described in
+    # docs/ARCHITECTURE.md §2 step 8).
+    response.headers["X-Response-Time-Ms"] = f"{duration_ms:.1f}"
+
     logger.info(
         "request: method=%s path=%s status=%d duration=%.1fms client=%s",
         request.method, request.url.path, response.status_code,
         duration_ms, client_ip,
     )
-
-    # Add timing header (useful for debugging latency)
-    response.headers["X-Response-Time-Ms"] = f"{duration_ms:.1f}"
     return response
 
 
@@ -259,11 +316,16 @@ class AutocompleteResponse(BaseModel):
 
 class BatchRequest(BaseModel):
     """Request body for batch autocomplete."""
-    texts: List[str] = Field(
+    texts: List[
+        Annotated[str, StringConstraints(min_length=1, max_length=1000)]
+    ] = Field(
         ...,
         min_length=1,
         max_length=50,
-        description="List of input texts to complete.",
+        description=(
+            "List of input texts to complete. Each text is capped at 1000 "
+            "characters to match the single-text endpoint."
+        ),
     )
     top_k: int = Field(default=5, ge=1, le=20)
     model: str = Field(default="ngram", pattern="^(ngram|markov)$")
