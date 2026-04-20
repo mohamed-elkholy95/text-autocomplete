@@ -136,6 +136,29 @@ class MarkovChainModel:
         )
         return self
 
+    def _smoothed_prob(self, current: str, target: str) -> float:
+        """Return P(target | current) with Laplace smoothing applied uniformly.
+
+        This always returns the properly smoothed probability, regardless of
+        whether the (current, target) transition was observed:
+
+            P(target | current) = (count(current -> target) + k)
+                                  / (count(current) + k * vocab_size)
+
+        When ``current`` itself is unknown we fall back to a uniform
+        distribution over the vocabulary (1 / |V|), matching the behaviour
+        of :meth:`_get_transition_probs`.
+        """
+        if current not in self._transitions:
+            return 1.0 / self._vocab_size if self._vocab_size else 0.0
+
+        count = self._transitions[current].get(target, 0)
+        total = self._word_counts[current]
+        smoothed_total = total + self.smoothing * self._vocab_size
+        if smoothed_total == 0:
+            return 0.0
+        return (count + self.smoothing) / smoothed_total
+
     def _get_transition_probs(self, word: str) -> List[Tuple[str, float]]:
         """Get the probability distribution over next words given current word.
 
@@ -268,14 +291,11 @@ class MarkovChainModel:
             # Get probability of tokens[i] given tokens[i-1]
             current = tokens[i - 1]
             target = tokens[i]
-            probs = self._get_transition_probs(current)
-
-            # Find the probability assigned to the actual next word
-            prob = next((p for word, p in probs if word == target), 1e-10)
+            prob = self._smoothed_prob(current, target)
 
             # Accumulate log probability (we use log to prevent underflow
             # when multiplying many small probabilities together)
-            total_log_prob += log(prob)
+            total_log_prob += log(max(prob, 1e-10))
             n_predictions += 1
 
         # Average log-probability per token
