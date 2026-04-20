@@ -112,6 +112,59 @@ def load_sample_data() -> str:
     return " ".join(SAMPLE_TEXTS * 5)
 
 
+def load_wikitext(
+    split: str = "train",
+    size: str = "2",
+    max_docs: Optional[int] = None,
+) -> str:
+    """Load the WikiText benchmark corpus from the HuggingFace Hub.
+
+    WikiText is the de-facto language modelling benchmark (Merity 2016,
+    still the active SOTA leaderboard on paperswithcode in 2026). It is
+    CC-BY-SA 4.0 and distributed as ``Salesforce/wikitext`` with four
+    configurations. This project uses the ``-v1`` configs (preprocessed
+    with the published tokenization) because our own :func:`tokenize`
+    does its own normalization on top.
+
+    Args:
+        split: "train", "validation", or "test".
+        size: "2" for WikiText-2 (~2M tokens, fast dev/CI) or "103" for
+            WikiText-103 (~103M tokens, the published benchmark).
+        max_docs: Optional cap on the number of articles to return, for
+            faster evaluation during development.
+
+    Returns:
+        The concatenated corpus as a single string, with inter-article
+        newlines preserved.
+
+    Raises:
+        ImportError: If the ``datasets`` package is not installed.
+        ValueError: If ``split`` or ``size`` is out of range.
+    """
+    if split not in {"train", "validation", "test"}:
+        raise ValueError(f"split must be train/validation/test, got {split!r}")
+    if size not in {"2", "103"}:
+        raise ValueError(f"size must be '2' or '103', got {size!r}")
+
+    try:
+        from datasets import load_dataset
+    except ImportError as e:  # pragma: no cover - environment guard
+        raise ImportError(
+            "load_wikitext requires the `datasets` package. "
+            "Install it with `pip install datasets`."
+        ) from e
+
+    config = f"wikitext-{size}-v1"
+    logger.info("Loading Salesforce/wikitext %s (split=%s)...", config, split)
+    ds = load_dataset("Salesforce/wikitext", config, split=split)
+    texts: List[str] = ds["text"]
+    if max_docs is not None:
+        texts = texts[:max_docs]
+    # Drop empty entries that the WikiText dataset uses as article separators.
+    texts = [t for t in texts if t.strip()]
+    return "\n".join(texts)
+
+
 def load_corpus_from_file(path: str, encoding: str = "utf-8") -> str:
     """Load a text corpus from a file on disk.
 

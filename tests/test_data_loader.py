@@ -1,6 +1,9 @@
 """Tests for the data loader module."""
 
+import os
+
 import pytest
+
 from src.data_loader import (
     load_sample_data,
     tokenize,
@@ -9,6 +12,14 @@ from src.data_loader import (
     train_test_split,
     get_corpus_stats,
     _remove_stopwords,
+    load_wikitext,
+)
+
+# Tests that hit huggingface.co are skipped by default to keep CI offline-safe.
+# Set RUN_NETWORK_TESTS=1 locally to exercise them.
+NETWORK_TESTS = os.getenv("RUN_NETWORK_TESTS", "").lower() in ("1", "true", "yes")
+network = pytest.mark.skipif(
+    not NETWORK_TESTS, reason="set RUN_NETWORK_TESTS=1 to run HF-hub tests"
 )
 
 
@@ -201,6 +212,35 @@ class TestTrainTestSplit:
         train, test = train_test_split(tokens, test_ratio=0.0, seed=42)
         assert len(train) == 3
         assert len(test) == 0
+
+
+class TestLoadWikitext:
+    """Tests for load_wikitext. Network-gated by default."""
+
+    def test_invalid_split_raises(self):
+        with pytest.raises(ValueError, match="split must be"):
+            load_wikitext(split="not-a-split")
+
+    def test_invalid_size_raises(self):
+        with pytest.raises(ValueError, match="size must be"):
+            load_wikitext(size="9999")
+
+    @network
+    def test_wikitext2_validation_loads(self):
+        """Smallest sensible slice: WikiText-2 validation (~3k docs)."""
+        text = load_wikitext(split="validation", size="2")
+        # Sanity: the validation split should be on the order of
+        # hundreds of thousands of characters.
+        assert isinstance(text, str)
+        assert len(text) > 100_000
+
+    @network
+    def test_max_docs_respected(self):
+        """max_docs should cap output well below the full validation split."""
+        capped = load_wikitext(split="validation", size="2", max_docs=20)
+        full = load_wikitext(split="validation", size="2")
+        # Capped slice should be a small fraction of the full split.
+        assert 0 < len(capped) < len(full) // 10
 
 
 class TestCorpusStats:
