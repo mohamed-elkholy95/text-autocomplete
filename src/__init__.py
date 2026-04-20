@@ -10,7 +10,7 @@ PUBLIC API:
 Models:
     NGramModel          — N-gram language model with backoff and interpolation
     MarkovChainModel    — First-order Markov chain with Laplace smoothing
-    LSTMModel           — PyTorch LSTM for next-token prediction
+    LSTMModel           — Optional PyTorch LSTM (word-level fit/predict_next)
 
 Decoding:
     BeamSearchDecoder   — Multi-hypothesis beam search for better predictions
@@ -21,9 +21,13 @@ Data:
     train_test_split    — Split tokens into training and test sets
 
 Evaluation:
-    compute_perplexity  — Measure model quality (lower is better)
-    autocomplete_accuracy — Top-k prediction accuracy
-    prediction_diversity  — How varied predictions are across inputs
+    compute_perplexity      — Measure model quality (lower is better)
+    autocomplete_accuracy   — Top-k prediction accuracy
+    prediction_diversity    — How varied predictions are across inputs
+    vocabulary_coverage     — Fraction of reference vocab the model predicts
+    prediction_confidence   — Top-1 prob / entropy / margin
+    generate_report         — Markdown report across all metrics
+    compare_models          — Side-by-side metric comparison
 
 Example:
     >>> from src import NGramModel, tokenize, load_sample_data
@@ -35,14 +39,25 @@ Example:
 
 from src.ngram_model import NGramModel
 from src.markov_model import MarkovChainModel
+from src.neural_model import LSTMModel
 from src.beam_search import BeamSearchDecoder
 from src.data_loader import tokenize, load_sample_data, train_test_split
-from src.evaluation import compute_perplexity, autocomplete_accuracy, prediction_diversity
+from src.evaluation import (
+    compute_perplexity,
+    autocomplete_accuracy,
+    prediction_diversity,
+    vocabulary_coverage,
+    prediction_confidence,
+    generate_report,
+    compare_models,
+)
+from src.config import API_VERSION as __version__
 
 __all__ = [
     # Models
     "NGramModel",
     "MarkovChainModel",
+    "LSTMModel",
     "BeamSearchDecoder",
     # Data utilities
     "tokenize",
@@ -52,6 +67,10 @@ __all__ = [
     "compute_perplexity",
     "autocomplete_accuracy",
     "prediction_diversity",
+    "vocabulary_coverage",
+    "prediction_confidence",
+    "generate_report",
+    "compare_models",
+    # Version
+    "__version__",
 ]
-
-__version__ = "2.1.0"

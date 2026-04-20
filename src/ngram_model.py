@@ -45,7 +45,7 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
-from src.config import RANDOM_SEED, MAX_NGRAM, MIN_NGRAM, TOP_K, MIN_FREQUENCY
+from src.config import RANDOM_SEED, MIN_NGRAM, TOP_K, MIN_FREQUENCY
 
 logger = logging.getLogger(__name__)
 
@@ -134,8 +134,9 @@ class NGramModel:
                 context = ngram[:-1] if len(ngram) > 1 else ()
                 self._context_counts[context] += 1
 
-        # Filter out rare n-grams (below minimum frequency threshold)
-        # This reduces noise from偶然co-occurrences
+        # Filter out rare n-grams (below minimum frequency threshold).
+        # This reduces noise from random co-occurrences that happen too
+        # few times to give a stable probability estimate.
         before = len(self._ngram_counts)
         self._ngram_counts = Counter({
             k: v for k, v in self._ngram_counts.items() if v >= self.min_freq
@@ -309,6 +310,13 @@ class NGramModel:
         - PPL 150-500: Fair — model captures some patterns
         - PPL > 500:  Poor — model barely better than random
 
+        IMPLEMENTATION NOTE:
+        We compute the true conditional probability directly from counts
+        (count(context + token) / count(context)) with backoff to shorter
+        orders. Earlier revisions delegated to predict_next() which caps at
+        top_k and silently floors ranks beyond the cap — a subtle bug that
+        inflated perplexity whenever the true token ranked outside the top-k.
+
         Args:
             tokens: Token sequence to evaluate on.
 
@@ -322,20 +330,38 @@ class NGramModel:
         count = 0
 
         for i in range(self.n - 1, len(tokens)):
-            # Build the context for this position
-            ctx = tokens[i - self.n + 1:i]
-            preds = self.predict_next(ctx)
             token = tokens[i]
-
-            # Find the probability assigned to the actual next token
-            # Default to a very small probability if the token wasn't predicted
-            prob = next((p for w, p in preds if w == token), 1e-10)
-
-            log_prob += log(prob)
+            prob = self._conditional_prob(tokens[i - self.n + 1:i], token)
+            log_prob += log(max(prob, 1e-10))
             count += 1
 
         avg = log_prob / max(count, 1)
         return float(np.exp(-avg))
+
+    def _conditional_prob(self, context: List[str], token: str) -> float:
+        """Return P(token | context) with stupid-backoff across orders.
+
+        Walks from the highest-order context the model knows down to the
+        unigram. Uses the first order where the context was actually seen
+        at least once, so ranks beyond top_k are not floored.
+        """
+        ctx = tuple(context[-(self.n - 1):]) if self.n > 1 else ()
+        while True:
+            ctx_count = self._context_counts.get(ctx, 0)
+            if ctx_count > 0:
+                ngram_count = self._ngram_counts.get(ctx + (token,), 0)
+                if ngram_count > 0:
+                    return ngram_count / ctx_count
+            if not ctx:
+                break
+            ctx = ctx[1:]
+
+        # Final unigram fallback using surviving unigrams.
+        total_unigrams = self._context_counts.get((), 0)
+        unigram_count = self._ngram_counts.get((token,), 0)
+        if total_unigrams > 0 and unigram_count > 0:
+            return unigram_count / total_unigrams
+        return 0.0
 
     def get_ngram_stats(self) -> Dict[int, int]:
         """Get the count of unique n-grams for each order.

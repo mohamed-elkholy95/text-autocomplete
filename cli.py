@@ -37,7 +37,7 @@ from pathlib import Path
 # Ensure the project root is importable
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from src.config import TOP_K, MAX_NGRAM, RANDOM_SEED
+from src.config import TOP_K, RANDOM_SEED
 from src.data_loader import (
     load_sample_data,
     tokenize,

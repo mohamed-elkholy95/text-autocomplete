@@ -136,6 +136,33 @@ class TestBatchAutocomplete:
         })
         assert resp.status_code == 200
 
+    def test_batch_rejects_oversized_text(self):
+        """Each batch entry must respect the 1000-char cap."""
+        resp = client.post("/autocomplete/batch", json={
+            "texts": ["a " * 600],  # 1200 characters
+            "top_k": 1,
+        })
+        assert resp.status_code == 422
+
+
+class TestRateLimiterIsolation:
+    """Rate-limit bucket behaviour should not depend on forged headers."""
+
+    def test_xff_header_ignored_by_default(self):
+        """Spoofed X-Forwarded-For must not mint fresh buckets in default mode."""
+        from src.api.main import _rate_buckets
+        before = set(_rate_buckets.keys())
+        for i in range(5):
+            r = client.post(
+                "/autocomplete",
+                json={"text": "machine learning", "top_k": 1},
+                headers={"x-forwarded-for": f"203.0.113.{i}"},
+            )
+            assert r.status_code == 200
+        after = set(_rate_buckets.keys())
+        # At most one new bucket should appear — the real peer IP.
+        assert len(after - before) <= 1
+
 
 class TestListModels:
     """Tests for the model listing endpoint."""

@@ -113,9 +113,21 @@ class TestNGramPerplexity:
         assert model.perplexity(["the", "cat"]) == float("inf")
 
     def test_perplexity_short_sequence(self, trained_model):
-        """Should handle sequences shorter than n-gram order gracefully."""
+        """Trigram model on a single token has no scoring positions, so the
+        loop averages zero log-prob over zero tokens and perplexity falls
+        through to exp(0) = 1.0. Documented edge case: callers need at
+        least ``n`` tokens to get a meaningful score."""
         ppl = trained_model.perplexity(["the"])
-        assert ppl > 0
+        assert ppl == pytest.approx(1.0)
+
+    def test_conditional_prob_matches_raw_counts(self, simple_model):
+        """_conditional_prob must equal count(ctx+tok) / count(ctx) when
+        the context is observed. Regression guard for the perplexity
+        top-k truncation bug that was floored to 1e-10."""
+        # With training tokens containing "the cat sat" 3 times and "the cat"
+        # appearing 3 times, P(sat | the, cat) must be exactly 1.0.
+        p = simple_model._conditional_prob(["the", "cat"], "sat")
+        assert p == pytest.approx(1.0)
 
     def test_perplexity_known_good_context(self, simple_model):
         """Perplexity on training-like data should be lower than random data."""

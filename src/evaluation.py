@@ -18,7 +18,7 @@ KEY METRICS:
 4. COVERAGE: What fraction of the vocabulary the model can predict.
 """
 
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Tuple
 import logging
 
 import numpy as np

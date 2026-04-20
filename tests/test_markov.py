@@ -159,6 +159,21 @@ class TestMarkovTransitions:
         assert model.get_top_transitions("the") == []
 
 
+class TestMarkovSmoothedProb:
+    """Tests for the _smoothed_prob helper used by perplexity."""
+
+    def test_smoothed_unseen_matches_laplace_formula(self, simple_model):
+        """For a seen word with an unseen next-word target, the probability
+        must equal smoothing / (count(current) + smoothing * vocab_size)
+        instead of the previous 1e-10 floor."""
+        vocab_size = simple_model.vocab_size
+        # In the fixture "the" appears 5 times; "xyz" never follows it.
+        assert "xyz" not in simple_model._transitions["the"]
+        p = simple_model._smoothed_prob("the", "xyz")
+        expected = simple_model.smoothing / (5 + simple_model.smoothing * vocab_size)
+        assert p == pytest.approx(expected)
+
+
 class TestMarkovSmoothing:
     """Tests for Laplace smoothing behavior."""
 

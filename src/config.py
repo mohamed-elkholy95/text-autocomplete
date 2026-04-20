@@ -27,7 +27,6 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
-logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -131,7 +130,7 @@ BEAM_CONFIG = {
 API_HOST = "0.0.0.0"  # Listen on all network interfaces
 API_PORT = 8010       # Port number for the FastAPI server
 API_TITLE = "Text Autocomplete API"
-API_VERSION = "2.0.0"
+API_VERSION = "2.2.0"  # keep in sync with src.__version__
 
 # ---------------------------------------------------------------------------
 # Streamlit Theme
