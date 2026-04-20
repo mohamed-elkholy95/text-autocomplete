@@ -1,214 +1,285 @@
-# Text Autocomplete — Architecture Guide
+# Architecture Guide
 
-## System Overview
+> Plain-language walkthrough of how the autocomplete system is put together,
+> why each piece exists, and what would change if this were a production service.
 
-This project implements a text autocomplete system using multiple language
-modeling approaches. Each model demonstrates a different strategy for the
-fundamental NLP task: **given a sequence of words, predict what comes next.**
+The project implements three language models behind a single
+`predict_next(context, top_k)` interface, composes them with a beam-search
+decoder, and exposes the whole thing through three interchangeable frontends
+(CLI, FastAPI, Streamlit). The goal is breadth of technique with a small,
+honest surface area — not a toy, not a pretend ChatGPT.
+
+---
+
+## 1. System Overview
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                        Data Pipeline                             │
-│  load_sample_data() → tokenize() → train_test_split()           │
-└──────────────────────────┬──────────────────────────────────────┘
+┌────────────────────────────────────────────────────────────────────┐
+│                         Data Pipeline                               │
+│   load_sample_data() / load_corpus_from_file()                      │
+│        → normalize_text() → tokenize() → train_test_split()         │
+└──────────────────────────┬─────────────────────────────────────────┘
                            │ tokens
           ┌────────────────┼────────────────┐
           ▼                ▼                ▼
-   ┌────────────┐  ┌─────────────┐  ┌────────────┐
-   │  N-gram    │  │   Markov    │  │    LSTM    │
-   │  Model     │  │   Chain     │  │   Neural   │
-   │            │  │             │  │   Model    │
-   │ Backoff +  │  │  Laplace    │  │  PyTorch   │
-   │ Interpol.  │  │  Smoothing  │  │  Sequence  │
-   └─────┬──────┘  └──────┬──────┘  └─────┬──────┘
-         │                │                │
-         └────────┬───────┘                │
-                  ▼                        │
-          ┌──────────────┐                 │
-          │  Beam Search │◄────────────────┘
-          │  Decoder     │
-          └──────┬───────┘
-                 │
-    ┌────────────┼────────────┐
-    ▼            ▼            ▼
-┌────────┐ ┌──────────┐ ┌──────────┐
-│  CLI   │ │ FastAPI  │ │Streamlit │
-│        │ │  REST    │ │Dashboard │
-│ cli.py │ │  API     │ │          │
-└────────┘ └──────────┘ └──────────┘
+   ┌────────────┐   ┌─────────────┐   ┌────────────┐
+   │  N-gram    │   │   Markov    │   │    LSTM    │
+   │  Model     │   │   Chain     │   │   Neural   │
+   │            │   │             │   │   Model    │
+   │ Backoff +  │   │  Laplace    │   │  PyTorch   │
+   │ Interpol.  │   │  Smoothing  │   │ (optional) │
+   └─────┬──────┘   └──────┬──────┘   └─────┬──────┘
+         │                 │                │
+         └─────────┬───────┘                │
+                   ▼                        │
+           ┌──────────────┐                 │
+           │  Beam Search │◄────────────────┘
+           │  Decoder     │
+           └──────┬───────┘
+                  │
+    ┌─────────────┼─────────────┐
+    ▼             ▼             ▼
+┌────────┐  ┌──────────┐  ┌──────────┐
+│  CLI   │  │ FastAPI  │  │Streamlit │
+│ cli.py │  │  REST    │  │Dashboard │
+└────────┘  └──────────┘  └──────────┘
 ```
 
-## Component Breakdown
+All three models implement the same `fit(tokens)` / `predict_next(context, top_k)`
+contract, which is what lets the beam-search decoder, the CLI, the API, and the
+Streamlit pages stay model-agnostic.
 
-### 1. Data Layer (`src/data_loader.py`)
+---
 
-**Responsibility:** Load, preprocess, and split text data.
+## 2. Request Lifecycle (API)
 
-| Function | Purpose | Educational Concept |
-|----------|---------|-------------------|
-| `load_sample_data()` | Load built-in corpus | Corpus design |
-| `tokenize()` | Text → token list | Tokenization strategies |
-| `train_test_split()` | Prevent data leakage | Evaluation methodology |
-| `build_ngrams()` | Create n-gram tuples | N-gram construction |
-| `get_corpus_stats()` | Corpus analysis | Exploratory data analysis |
-
-**Design Decision:** The sample corpus is hardcoded rather than loaded from
-files. This keeps the project self-contained — anyone can clone and run it
-without downloading datasets. For production, replace `SAMPLE_TEXTS` with
-a real corpus loader.
-
-### 2. Statistical Models
-
-#### N-gram Model (`src/ngram_model.py`)
-
-**Core Idea:** Estimate P(next_word | previous_words) by counting co-occurrences.
+What actually happens when a client POSTs to `/autocomplete`:
 
 ```
-Training:   "the cat sat" → count[("the", "cat", "sat")] += 1
-Prediction: P("sat" | "the", "cat") = count("the cat sat") / count("the cat")
+1. Client  ──POST /autocomplete {text, top_k, model}─▶ FastAPI
+2. Middleware
+      a. resolve client IP (X-Forwarded-For aware)
+      b. token-bucket rate-limit check (30 burst, 2 rps refill)
+      c. start latency timer
+3. Pydantic validates AutocompleteRequest schema
+4. tokenize(text) → lowercase, split words/punct, NFC normalize
+5. _get_trained_ngram() / _get_trained_markov()
+      - first call: fit on sample corpus, cache in module-level dict
+      - later calls: hit cache (≈μs)
+6. model.predict_next(tokens, top_k)
+      - N-gram: backoff from n → n-1 → ... → 1
+      - Markov: transition row lookup + Laplace smoothing
+7. Build AutocompleteResponse (suggestions + last-5-word context)
+8. Middleware stamps X-Response-Time-Ms, logs structured line
+9. Client  ◄──200 JSON── FastAPI
 ```
 
-**Key Features:**
-- Multi-order support (1-gram through 4-gram)
-- Backoff smoothing: falls back to lower orders when context unseen
-- Interpolated smoothing: blends all orders simultaneously with λ weights
-- Model persistence via JSON serialization
+Latency on this corpus is dominated by tokenization and the first-request
+training step; subsequent requests are cache hits and finish in under a
+millisecond on a laptop CPU.
 
-**When to use:** Fast prototyping, small datasets, interpretable results.
+---
 
-#### Markov Chain (`src/markov_model.py`)
+## 3. Components
 
-**Core Idea:** Model language as a state machine where each word is a state
-and transitions have probabilities.
+### 3.1 Data Layer — `src/data_loader.py`
+
+| Function                  | Purpose                               | Concept                    |
+| ------------------------- | ------------------------------------- | -------------------------- |
+| `load_sample_data()`      | Built-in 40-sentence corpus × 5       | Corpus design              |
+| `load_corpus_from_file()` | Read UTF-8 text from disk             | Real-world ingestion       |
+| `normalize_text()`        | NFC + smart-quote/dash cleanup        | Unicode hygiene            |
+| `tokenize()`              | `\w+|[^\w\s]` regex, lowercase        | Word/punct tokenization    |
+| `build_ngrams()`          | Sliding n-gram tuples                 | N-gram construction        |
+| `train_test_split()`      | Seeded random split                   | Evaluation methodology     |
+| `get_corpus_stats()`      | Type/token counts, lengths            | Exploratory data analysis  |
+
+**Design choice.** The sample corpus is hardcoded so the repo is runnable the
+moment you clone it — no downloads, no auth keys. `load_corpus_from_file()` is
+the hook for real data.
+
+### 3.2 Statistical Models
+
+**N-gram (`src/ngram_model.py`).**
+Counts word co-occurrences of orders 1..n and estimates
+`P(w_n | w_{n-1}, ..., w_{n-k+1}) = count(ngram) / count(context)`.
+`MIN_FREQUENCY=2` prunes rare n-grams (noisy estimates on small corpora).
+Two smoothing modes: **backoff** (use the highest-order ngram that was seen;
+fall back otherwise) and **interpolation** (blend orders with λ weights).
+Persisted as JSON via `save()` / `load()`.
+
+**Markov chain (`src/markov_model.py`).**
+First-order transition graph: `P[word_i][word_j] = P(next=j | current=i)`
+with Laplace (add-k) smoothing so unseen transitions never get probability 0
+(which would push perplexity to infinity). Exposes `generate_text()` with a
+temperature parameter for sampling-based generation.
+
+**LSTM (`src/neural_model.py`).**
+`Embedding → 2-layer LSTM (dropout 0.2) → Linear → Softmax`. Torch is an
+*optional* dependency — when it's not installed, `HAS_TORCH=False` and the
+module returns deterministic mock outputs so `pytest` stays green on a
+minimal install.
+
+### 3.3 Beam Search Decoder — `src/beam_search.py`
+
+Wraps any model implementing `predict_next` and performs multi-step search.
+At each step: expand every beam with `candidates_per_step` next tokens, score
+in log-space (`new_log_prob = log_prob + log(prob)` — avoids underflow), prune
+to `beam_width`, repeat.
+
+**Length penalty.** This project uses `score = log_prob / length^α` with
+`α = 0.6`. A common alternative in the literature is the GNMT form
+`((5 + length) / 6)^α` (Wu et al., 2016); both aim to stop short hypotheses
+from winning just because they multiply fewer probabilities. The simple form
+is kept here for clarity.
+
+### 3.4 Evaluation — `src/evaluation.py`
+
+| Metric               | What it measures                                   | Code                          |
+| -------------------- | -------------------------------------------------- | ----------------------------- |
+| Perplexity           | Geometric mean of inverse prob on test data        | `compute_perplexity()`        |
+| Top-k accuracy       | True next word appears in top-k predictions        | `autocomplete_accuracy()`     |
+| Prediction diversity | `unique(top-1) / total` — guards against trivial models | `prediction_diversity()` |
+| Vocabulary coverage  | Fraction of vocab the model ever predicts          | `vocabulary_coverage()`       |
+| Confidence           | Top-1 prob, Shannon entropy, top-1/top-2 margin    | `prediction_confidence()`     |
+
+### 3.5 API Layer — `src/api/main.py`
+
+FastAPI with seven endpoints:
+
+| Method | Path                    | Purpose                                      |
+| ------ | ----------------------- | -------------------------------------------- |
+| GET    | `/health`               | Liveness probe (skips rate-limit)            |
+| POST   | `/autocomplete`         | Single prediction, model selectable          |
+| POST   | `/autocomplete/batch`   | Up to 50 texts in one round trip             |
+| POST   | `/generate`             | Temperature-controlled Markov generation     |
+| GET    | `/models`               | Discoverable model catalogue                 |
+| GET    | `/vocab/stats`          | Corpus + vocab numbers                       |
+| GET    | `/metrics`              | Per-endpoint counters + rate-limit rejects   |
+
+Cross-cutting concerns live in middleware: X-Forwarded-For-aware IP
+resolution, in-memory token-bucket rate limiting (30 burst, 2 rps refill),
+request counting, and latency logging via `X-Response-Time-Ms`. Models are
+trained once and cached in a module-level dict so requests don't retrain.
+
+### 3.6 Frontends
+
+| Interface         | Technology | Entry point                    |
+| ----------------- | ---------- | ------------------------------ |
+| CLI               | argparse   | `cli.py {train,predict,eval,info}` |
+| REST API          | FastAPI    | `uvicorn src.api.main:app`     |
+| Interactive app   | Streamlit  | `streamlit run streamlit_app/app.py` |
+
+---
+
+## 4. Key Design Decisions
+
+### Why three models instead of one?
+The three models sit on different points of the
+complexity-vs-interpretability curve, which makes the project a useful
+teaching surface:
+
+| Model  | Training cost | Interpretability       | Data needs | Latency |
+| ------ | ------------- | ---------------------- | ---------- | ------- |
+| N-gram | O(N) counts   | High (inspect counts)  | Small      | μs      |
+| Markov | O(N) counts   | High (transition table)| Small      | μs      |
+| LSTM   | GPU-hours     | Low (black box)        | Large      | ms      |
+
+### Why JSON for persistence instead of pickle?
+Pickle is faster but executes arbitrary code on load, so a malicious model
+file is a shell on the server. JSON is:
+- **Safe** — no code execution path on load
+- **Inspectable** — any editor can read it
+- **Portable** — JavaScript, Go, anything can parse it
+
+### Why in-memory rate limiting and model caching?
+Deliberate simplicity. The token-bucket algorithm is identical whether the
+bucket state lives in a dict, in Redis, or behind an API gateway — only the
+storage changes. Same for the model cache. See §5 for what breaks at scale.
+
+### Why absolute imports everywhere?
+`from src.config import ...` works uniformly from the test runner, from
+`uvicorn src.api.main:app`, and from CLI/Streamlit entry points (which
+prepend the project root to `sys.path`). Relative imports would couple to
+the runner.
+
+### Why keep PyTorch optional?
+The n-gram and Markov models are the teaching surface and don't need it. A
+new contributor can install `requirements.txt`, run every test, hit every
+API endpoint, and never see a torch error.
+
+---
+
+## 5. Production Gaps (known and intentional)
+
+What this project does *not* do, flagged so nobody is surprised:
+
+- **No subword tokenization.** Whitespace + regex tokenization means
+  `"pretraining"` and `"pre-training"` are different tokens. Real systems
+  use BPE, WordPiece, or SentencePiece.
+- **Per-process state.** Rate-limit buckets and model caches live in
+  module globals. Run two uvicorn workers and you get two caches, two
+  independently-refilling buckets per IP, and no shared metrics.
+  Production fix: Redis for buckets/metrics, and either a shared model
+  artifact on disk or a model server (TorchServe, Triton, Ray Serve).
+- **No authentication.** Every endpoint is public. A real deployment would
+  sit behind API-key auth, OAuth, or an API gateway.
+- **CORS wildcard.** `allow_origins=["*"]` is fine for a demo. In
+  production, pin it to the actual frontend origin.
+- **Small corpus, inflated perplexity.** On the 40-sentence sample corpus,
+  evaluated perplexity is huge (millions) because the test split contains
+  many n-grams that were never seen in training. This is a small-data
+  artefact, not a model bug — swap in WikiText-103 or Gutenberg and the
+  numbers collapse into the 50–300 range. Top-k accuracy and diversity
+  are the better signals on this corpus.
+- **No observability beyond log lines.** `/metrics` is a hand-rolled
+  counter, not Prometheus. A real deployment would export structured
+  metrics (requests, latency histograms, cache hit ratio) to a time-series
+  backend.
+
+---
+
+## 6. Scaling Path
+
+If the goal were to take this from demo to service, here is the shortest
+credible path without a full rewrite:
+
+1. **Move state out of the process.** Rate-limit buckets and request
+   metrics → Redis. Model cache → a shared read-only artefact on disk (or
+   object storage) loaded by every worker at startup.
+2. **Run multiple workers.** `uvicorn --workers N` or gunicorn with
+   uvicorn workers. With step 1 done, this is safe.
+3. **Put a gateway in front.** TLS termination, auth, per-route rate limits,
+   request-size caps.
+4. **Export real metrics.** `prometheus_fastapi_instrumentator`, ship to
+   Grafana. Alert on error rate and p95 latency, not CPU.
+5. **Replace the model if needed.** The `predict_next` interface is the
+   seam — swap in a transformer or a hosted model behind the same signature
+   without touching the frontends.
+
+---
+
+## 7. File Map
 
 ```
-State: "learning" → {("is", 0.3), ("models", 0.2), ("algorithms", 0.15), ...}
-```
-
-**Key Features:**
-- Explicit transition matrix (inspectable, visualizable)
-- Laplace smoothing prevents zero-probability transitions
-- Text generation via random walk through the state graph
-- Temperature-controlled sampling for creativity vs. coherence
-
-**When to use:** Visualization, text generation, teaching probabilistic models.
-
-### 3. Neural Model (`src/neural_model.py`)
-
-**Core Idea:** Learn dense vector representations that capture semantic
-similarity, then predict the next token from the hidden state.
-
-```
-Embedding → LSTM layers → Linear → Softmax → next token distribution
-```
-
-**Key Features:**
-- 2-layer LSTM with dropout regularization
-- Graceful fallback when PyTorch is not installed
-- Configurable via `NEURAL_CONFIG` in `config.py`
-
-**When to use:** Larger datasets, capturing long-range dependencies.
-
-### 4. Beam Search Decoder (`src/beam_search.py`)
-
-**The Problem:** Greedy decoding (always pick the top-1 prediction) can lead
-to locally optimal but globally suboptimal sequences.
-
-**The Solution:** Maintain `beam_width` parallel hypotheses, expand all of
-them at each step, then prune to keep the best.
-
-```
-Step 0: ["the"]
-Step 1: ["the cat", "the neural", "the machine"]     ← expand & prune
-Step 2: ["the cat sat", "the neural network", ...]    ← expand & prune
-```
-
-**Length Penalty:** Without normalization, shorter sequences always score
-higher (fewer probability multiplications). The length penalty `α` controls
-the trade-off: `score = log_prob / length^α`.
-
-### 5. Evaluation (`src/evaluation.py`)
-
-| Metric | Measures | Good Value |
-|--------|----------|------------|
-| Perplexity | How surprised the model is by test data | < 100 |
-| Top-k Accuracy | Correct word in top-k suggestions | > 0.3 |
-| Diversity | Variety of predictions across inputs | > 0.5 |
-| Coverage | Fraction of vocab the model can predict | > 0.3 |
-
-### 6. API Layer (`src/api/main.py`)
-
-FastAPI REST endpoints with:
-- **Rate limiting** via token bucket algorithm (per-client-IP)
-- **Model caching** to avoid retraining on each request
-- **Request metrics** for monitoring and observability
-- **CORS** enabled for cross-origin web app integration
-- **Pydantic validation** for type-safe request/response schemas
-
-### 7. Interfaces
-
-| Interface | Technology | Purpose |
-|-----------|------------|---------|
-| `cli.py` | argparse | Terminal-based train/predict/eval |
-| `src/api/main.py` | FastAPI | REST API for integration |
-| `streamlit_app/` | Streamlit | Interactive visual dashboard |
-
-## Design Decisions
-
-### Why Multiple Models?
-
-Educational value. Each model represents a different point on the
-complexity–interpretability spectrum:
-
-| Model | Complexity | Interpretability | Data Needs |
-|-------|-----------|-------------------|------------|
-| N-gram | Low | High (inspect counts) | Small |
-| Markov | Low | High (transition matrix) | Small |
-| LSTM | High | Low (black box) | Large |
-
-### Why JSON for Model Persistence?
-
-Pickle is faster but has security risks (arbitrary code execution) and
-isn't human-readable. JSON is:
-- Safe to load from untrusted sources
-- Inspectable with any text editor
-- Language-agnostic (could load in JavaScript, Go, etc.)
-
-### Why In-Memory Rate Limiting?
-
-For a portfolio project, simplicity wins. In production, you'd use Redis
-or a service mesh (Istio, Envoy) for distributed rate limiting. The token
-bucket algorithm is the same either way — the storage backend changes,
-not the logic.
-
-## File Map
-
-```
-10-text-autocomplete/
+text-autocomplete/
 ├── src/
-│   ├── __init__.py          # Public API exports
-│   ├── config.py            # Centralized configuration
-│   ├── data_loader.py       # Corpus loading and preprocessing
-│   ├── ngram_model.py       # N-gram model (backoff + interpolation)
-│   ├── markov_model.py      # Markov chain model
-│   ├── neural_model.py      # LSTM neural model
-│   ├── beam_search.py       # Beam search decoder
-│   ├── evaluation.py        # Metrics (perplexity, accuracy, diversity)
+│   ├── __init__.py          # Public API exports (keep in sync)
+│   ├── config.py            # Hyperparameters, paths, API settings
+│   ├── data_loader.py       # Corpus, normalize, tokenize, split
+│   ├── ngram_model.py       # N-gram LM, backoff + interpolation, JSON persist
+│   ├── markov_model.py      # First-order Markov, Laplace, text generation
+│   ├── neural_model.py      # Optional LSTM (torch-guarded)
+│   ├── beam_search.py       # Beam search with length penalty
+│   ├── evaluation.py        # Perplexity, top-k, diversity, coverage, confidence
 │   └── api/
-│       └── main.py          # FastAPI REST API with rate limiting
-├── tests/
-│   ├── test_ngram.py        # N-gram unit tests
-│   ├── test_markov.py       # Markov chain unit tests
-│   ├── test_beam_search.py  # Beam search unit tests
-│   ├── test_evaluation.py   # Evaluation metric tests
-│   ├── test_data_loader.py  # Data pipeline tests
-│   ├── test_api.py          # API endpoint tests
-│   ├── test_neural.py       # Neural model tests
-│   └── test_integration.py  # End-to-end pipeline tests
-├── streamlit_app/           # Interactive dashboard
-├── cli.py                   # Command-line interface
+│       └── main.py          # FastAPI app, middleware, endpoints
+├── streamlit_app/           # Overview / Autocomplete / Metrics pages
+├── tests/                   # 8 test files, 77+ tests
+├── cli.py                   # train | predict | eval | info
 ├── docs/
-│   └── ARCHITECTURE.md      # This file
+│   ├── ARCHITECTURE.md      # This file
+│   └── GLOSSARY.md          # Terminology reference
 ├── requirements.txt
 └── README.md
 ```

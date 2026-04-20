@@ -1,154 +1,267 @@
 # NLP & Language Modeling Glossary
 
-A reference guide for the concepts and terminology used throughout this project.
-Each term includes a plain-English definition and where it appears in the code.
+A reference for every term used in this project. Each entry gives a
+plain-English definition and points to the code that implements it, so the
+glossary stays anchored to real behaviour rather than drifting into
+textbook material the project doesn't actually use.
 
 ---
 
-## Core Concepts
+## 1. Core Concepts
 
 ### Token
-A unit of text after splitting. Usually a word or punctuation mark.
-- `"Machine learning is great."` → `["machine", "learning", "is", "great", "."]`
+A unit of text after splitting — usually a word or a punctuation mark.
+`"Machine learning is great."` → `["machine", "learning", "is", "great", "."]`.
 - **Code:** `src/data_loader.py → tokenize()`
 
-### Vocabulary (Vocab)
-The set of all unique tokens in the training data. Vocabulary size `V`
-determines model complexity — more unique words = more parameters.
+### Vocabulary (vocab, `V`)
+The set of unique tokens seen during training. `|V|` is the upper bound on
+what the model can ever predict; a model never outputs a word it hasn't
+seen.
 - **Code:** `NGramModel._vocab`, `MarkovChainModel._word_to_idx`
 
 ### Corpus
-A collection of text used for training. Our corpus includes sentences about
-ML, software engineering, data science, and technology.
-- **Code:** `src/data_loader.py → SAMPLE_TEXTS`
+A body of text used for training. This project ships a 40-sentence
+built-in corpus covering ML, software engineering, data science, and
+general tech, repeated 5× to give the statistical models enough counts.
+- **Code:** `src/data_loader.py → SAMPLE_TEXTS`, `load_corpus_from_file()`
 
 ### Language Model (LM)
-A model that assigns probabilities to sequences of words. The core question:
-"Given some words, what word is most likely to come next?"
-- **Code:** All models in `src/` are language models.
+A model that assigns probability to sequences of words. The basic
+question: *given some words, what's likely to come next?*
+- **Code:** every model in `src/` implementing `predict_next()`
+
+### Context
+The window of preceding tokens fed to the model. For an n-gram model, the
+context is the last `n-1` tokens; for a Markov chain, just the last one.
+- **Code:** sliced inside each `predict_next()`. `CONTEXT_WINDOW = 50` in
+  `src/config.py` is declared as a future cap for long inputs but is not
+  yet referenced by the models — a deliberate placeholder, not live code.
+
+### Normalization
+Cleaning raw text before tokenization: Unicode NFC, smart-quote/dash
+folding, whitespace collapse. Without this, `"café"` (composed) and
+`"cafe\u0301"` (decomposed) count as different words.
+- **Code:** `src/data_loader.py → normalize_text()`
 
 ---
 
-## Statistical Concepts
+## 2. Statistical Concepts
 
 ### N-gram
-A contiguous sequence of `n` items from text.
-- **Unigram** (n=1): `"cat"` — individual word frequency
-- **Bigram** (n=2): `"the cat"` — word pair frequency
-- **Trigram** (n=3): `"the cat sat"` — three-word pattern
+A contiguous sequence of `n` tokens.
+- **Unigram** (n=1): `"cat"`
+- **Bigram** (n=2): `"the cat"`
+- **Trigram** (n=3): `"the cat sat"`
 - **Code:** `src/ngram_model.py`, `src/data_loader.py → build_ngrams()`
 
 ### Markov Property
-The assumption that the future depends only on the present state, not the
-entire history. For language: P(next_word | all_previous) ≈ P(next_word | last_word).
-- **Code:** `src/markov_model.py` — first-order Markov chain
+The assumption that the future depends only on the present state, not on
+the full history: `P(w_n | w_1..w_{n-1}) ≈ P(w_n | w_{n-1})` for a
+first-order chain. An n-gram model uses an `(n-1)`-order Markov
+assumption.
+- **Code:** `src/markov_model.py` (first-order), `src/ngram_model.py`
+
+### Maximum Likelihood Estimation (MLE)
+The "just count" approach: `P(w | context) = count(context, w) / count(context)`.
+No smoothing. In this project, you get pure MLE by setting
+`MarkovChainModel(smoothing=0.0)`.
+- **Code:** `MarkovChainModel._get_transition_probs()` with `smoothing=0.0`
+
+### Sparse data problem
+With vocab `V`, there are `V^n` possible n-grams; for `V=10,000` and
+`n=3` that's `10^12`. Almost all will be unseen in any realistic corpus,
+and MLE assigns them probability 0 — which makes perplexity infinite
+and breaks prediction for any unseen context. The fix is smoothing.
 
 ### Smoothing
-Techniques to handle unseen n-grams (words or combinations not in training data).
-Without smoothing, unseen events get probability 0, breaking the model.
+Techniques that shift some probability mass onto unseen events.
 
-| Technique | How It Works | Trade-off |
-|-----------|-------------|-----------|
-| Laplace (Add-1) | Add 1 to every count | Simple but over-smooths |
-| Backoff | Fall back to shorter n-gram | Ignores lower-order when higher exists |
-| Interpolation | Blend all n-gram orders | Better but needs tuning |
+| Technique       | How it works                          | Trade-off                                          |
+| --------------- | ------------------------------------- | -------------------------------------------------- |
+| Laplace (add-k) | Add `k` to every count                | Simple, over-smooths when `V` is large             |
+| Backoff         | If higher-order unseen, drop to lower | Ignores lower orders when a higher one is seen     |
+| Interpolation   | Weighted blend of all orders with λ   | Better quality, needs λ tuning                     |
 
-- **Code:** `NGramModel.predict_next()` (backoff), `predict_next_interpolated()` (interpolation),
+- **Code:** `NGramModel.predict_next()` (backoff),
+  `predict_next_interpolated()` (interpolation),
   `MarkovChainModel._get_transition_probs()` (Laplace)
 
-### Transition Matrix
-A matrix where entry T[i][j] = P(word_j follows word_i). Each row sums to 1.0.
-Think of it as a probability map: "from this word, where can I go?"
-- **Code:** `MarkovChainModel._transitions`
+### Transition matrix
+A matrix where `T[i][j] = P(next_word = j | current_word = i)`, with
+each row summing to 1.
+- **Code:** `MarkovChainModel._transitions` (stored as
+  `Dict[str, Counter]` for sparsity, not a dense matrix)
+
+### Log-probability
+`log P(sequence) = Σ log P(w_i | context_i)`. Working in log-space turns
+multiplication into addition and avoids floating-point underflow when
+multiplying hundreds of small probabilities.
+- **Code:** `src/beam_search.py:174` (`new_log_prob = log_prob + np.log(prob)`)
 
 ---
 
-## Evaluation Metrics
+## 3. Evaluation Metrics
 
 ### Perplexity (PPL)
-The primary metric for language models. Measures how "surprised" the model
-is by test data. Lower is better.
-- **PPL = 1:** Perfect prediction (impossible in practice)
-- **PPL = 10:** Model narrows each prediction to ~10 equally likely words
-- **PPL = V:** No better than random guessing
-- **Formula:** PPL = exp(-1/N × Σ log P(w_i | context))
+The dominant metric for language models. Geometric mean of inverse
+probabilities on test data. Lower is better.
+
+| PPL     | Intuition                                    |
+| ------- | -------------------------------------------- |
+| 1       | Perfect prediction (impossible in practice)  |
+| ~10     | Model narrows each choice to ~10 candidates  |
+| ~`|V|`  | No better than uniform random guessing       |
+
+Formula: `PPL = exp(-1/N × Σ log P(w_i | context_i))`. On a small corpus
+with many unseen test n-grams, PPL inflates dramatically — so treat
+small-corpus PPL as a sanity check, not a benchmark.
 - **Code:** `src/evaluation.py → compute_perplexity()`
 
-### Top-k Accuracy
-The fraction of test cases where the correct next word appears in the
-model's top-k predictions. Higher is better.
-- **Top-1:** Strict — only the #1 prediction counts
-- **Top-5:** Lenient — correct word anywhere in top 5
+### Top-k accuracy
+Fraction of test cases where the true next word appears in the model's
+top-k predictions. Top-1 is strict; top-5 matches how autocomplete UIs
+actually surface suggestions.
 - **Code:** `src/evaluation.py → autocomplete_accuracy()`
 
-### Prediction Diversity
-Measures how varied the model's top predictions are across different
-inputs. A model that always predicts "the" has zero diversity.
+### Prediction diversity
+`unique(top-1) / total_predictions`. A model that always predicts
+`"the"` has high accuracy on common positions but zero diversity — and
+is useless as a product. Diversity catches those trivial wins.
 - **Code:** `src/evaluation.py → prediction_diversity()`
 
-### Vocabulary Coverage
-What fraction of the vocabulary appears in the model's predictions.
-High coverage + high accuracy = ideal model.
+### Vocabulary coverage
+Fraction of the reference vocab the model ever predicts across the test
+set. High coverage + high accuracy = a model worth shipping.
 - **Code:** `src/evaluation.py → vocabulary_coverage()`
 
+### Confidence (top-1 prob, entropy, margin)
+Three ways to ask *how sure* the model is:
+- **Top-1 probability** — mass on the best prediction
+- **Shannon entropy** — `H = −Σ p log₂ p`; high H = spread-out, uncertain
+- **Margin** — `p(top-1) − p(top-2)`; big margin = clear winner
+
+- **Code:** `src/evaluation.py → prediction_confidence()`
+
 ---
 
-## Decoding Strategies
+## 4. Decoding Strategies
 
-### Greedy Decoding
-Always pick the single most probable next token. Fast but often produces
-repetitive or suboptimal sequences. Equivalent to beam search with width=1.
+### Greedy decoding
+Always take the argmax at each step. Fastest option; equivalent to
+beam search with `beam_width=1`. Often produces repetitive or
+locally-optimal-but-globally-bad sequences.
 
-### Beam Search
-Maintain multiple candidate sequences in parallel, expanding and pruning
-at each step. Finds better sequences than greedy at the cost of more computation.
-- **Beam width:** Number of parallel candidates (higher = more thorough)
-- **Length penalty:** Prevents bias toward shorter sequences
+### Beam search
+Keep `beam_width` parallel hypotheses; at each step expand each one
+with top-k candidates, score, and prune back to `beam_width`. Better
+sequences at a cost proportional to `beam_width × candidates_per_step`.
 - **Code:** `src/beam_search.py → BeamSearchDecoder`
 
-### Temperature Sampling
-Reshapes the probability distribution before sampling:
-- **T < 1.0:** Sharper distribution → more deterministic (focused)
-- **T = 1.0:** Original probabilities → natural diversity
-- **T > 1.0:** Flatter distribution → more random (creative)
-- **Code:** `MarkovChainModel.generate_text()` — temperature parameter
+### Length penalty
+Without normalization, shorter sequences always win because each
+additional token multiplies the probability by `<1.0`. This project
+uses the simple form:
+
+```
+score = log_prob / length^α     (α = 0.6 by default)
+```
+
+A common alternative is Wu et al. (2016) GNMT:
+
+```
+score = log_prob / ((5 + length) / 6)^α
+```
+
+Both aim to remove the short-sequence bias; GNMT's form gives a
+smoother penalty for very short sequences.
+- **Code:** `BeamSearchDecoder._length_normalized_score()`
+
+### Temperature sampling
+Rescales logits before softmax: `p'_i ∝ p_i^(1/T)`.
+- `T < 1.0` — sharper, more deterministic (boring but safe)
+- `T = 1.0` — original distribution
+- `T > 1.0` — flatter, more random (creative but noisier)
+
+Used for text generation, not for ranked autocomplete.
+- **Code:** `MarkovChainModel.generate_text()` (temperature arg)
 
 ---
 
-## Neural Network Concepts
+## 5. Neural Concepts (optional path)
 
 ### Embedding
-A learned mapping from discrete tokens to dense vectors. Words with similar
-meanings end up with similar vectors: vec("king") - vec("man") ≈ vec("queen") - vec("woman").
-- **Code:** `LSTMModel.embedding`
+A learned mapping from discrete tokens to dense vectors. Similar words
+end up close in vector space; classic example:
+`vec(king) − vec(man) + vec(woman) ≈ vec(queen)`.
+- **Code:** `LSTMModel.embedding` (`nn.Embedding`)
 
 ### LSTM (Long Short-Term Memory)
-A recurrent neural network variant that can learn long-range dependencies.
-Uses gates (forget, input, output) to control information flow through time.
+A recurrent network with gated memory cells (forget/input/output gates)
+designed to learn long-range dependencies without the vanishing-gradient
+problem of vanilla RNNs.
 - **Code:** `src/neural_model.py → LSTMModel`
 
 ### Dropout
-Randomly zeroes neurons during training to prevent overfitting. Forces the
-network to be robust — no single neuron can become a "single point of failure."
-- **Code:** `LSTMModel.__init__()` — dropout=0.2
+Randomly zero a fraction of neurons during training so the network
+can't rely on any single unit. Off at inference.
+- **Code:** `LSTMModel.__init__()` — `dropout=0.2` from `NEURAL_CONFIG`
+
+### Torch-optional fallback
+If `import torch` fails, the neural module sets `HAS_TORCH = False` and
+all training/prediction functions return deterministic mock values so
+the rest of the project and the test suite still work.
+- **Code:** `src/neural_model.py → HAS_TORCH` guard
 
 ---
 
-## API & Engineering Concepts
+## 6. API & Engineering Concepts
 
-### Token Bucket (Rate Limiting)
-An algorithm that controls request flow. Each client has a "bucket" of tokens;
-each request consumes one. Tokens refill at a fixed rate. Empty bucket = rejected.
-Used by AWS, Stripe, and most cloud APIs.
+### Token bucket (rate limiting)
+Each client gets a bucket that holds up to `MAX_TOKENS` tokens. Every
+request consumes one token; tokens refill at `REFILL_RATE` per second.
+Empty bucket → HTTP 429. This is the same algorithm AWS API Gateway
+and Stripe use — simple, memory-efficient, and allows short bursts
+while enforcing a long-term rate. In this project: 30-token burst,
+2-token/sec refill.
 - **Code:** `src/api/main.py → _check_rate_limit()`
 
-### Model Caching
-Store trained models in memory so they persist across API requests. Without
-caching, every request would retrain the model (expensive and slow).
-- **Code:** `src/api/main.py → _model_cache`
+### Model caching
+Trained models are stored in a module-level dict (`_model_cache`) so
+requests after the first don't retrain. Per-process, not shared across
+workers — a deliberate simplification (see ARCHITECTURE §5).
+- **Code:** `src/api/main.py → _get_trained_ngram()`, `_get_trained_markov()`
 
 ### CORS (Cross-Origin Resource Sharing)
-A browser security mechanism that controls which domains can call your API.
-Without CORS headers, a web app on `example.com` can't call an API on
-`api.example.com`.
+Browser-enforced rule that a page on origin A can only call APIs on
+origin B if B sends explicit Access-Control-Allow-* headers. The API
+opens CORS fully (`allow_origins=["*"]`) for the demo; production would
+pin it to the real frontend.
 - **Code:** `src/api/main.py → CORSMiddleware`
+
+### Pydantic validation
+Every request and response is a typed Pydantic model. FastAPI rejects
+malformed input with a structured 422 before it reaches the endpoint,
+and auto-generates OpenAPI/Swagger docs from the same schemas.
+- **Code:** `AutocompleteRequest`, `AutocompleteResponse`, `BatchRequest`,
+  `GenerateRequest`, `GenerateResponse` in `src/api/main.py`
+
+### Health check
+A dependency-free `GET /health` endpoint used by load balancers and
+orchestrators (k8s, Docker Compose) to decide whether to route traffic.
+Skipped by the rate limiter so external probes can't lock themselves out.
+- **Code:** `src/api/main.py → @app.get("/health")`
+
+### Middleware
+Code that wraps every request/response cycle. Order matters here:
+IP resolution → rate-limit check → start timer → endpoint → stop timer
+→ stamp `X-Response-Time-Ms` → log. Middleware is where cross-cutting
+concerns (auth, rate limits, logging) live in FastAPI.
+- **Code:** `src/api/main.py → rate_limit_and_metrics_middleware`
+
+### JSON model persistence
+Models serialize to human-readable JSON rather than pickle. Two
+reasons: pickle executes arbitrary code on load (a security risk for
+models downloaded over the network), and JSON is portable and
+debuggable with any text editor.
+- **Code:** `NGramModel.save()` / `load()`
