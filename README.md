@@ -4,10 +4,12 @@
 
 **N-gram, Markov Chain & Beam Search language models** for text completion with perplexity evaluation
 
-[![Python](https://img.shields.io/badge/Python-3.12-3776AB?style=flat-square&logo=python)](https://python.org)
-[![Tests](https://img.shields.io/badge/Tests-160%2B%20passed-success?style=flat-square)](#)
-[![FastAPI](https://img.shields.io/badge/FastAPI-0.100-009688?style=flat-square)](https://fastapi.tiangolo.com)
-[![Streamlit](https://img.shields.io/badge/Streamlit-1.28-FF4B4B?style=flat-square)](https://streamlit.io)
+[![Python](https://img.shields.io/badge/Python-3.12%2B-3776AB?style=flat-square&logo=python)](https://python.org)
+[![Tests](https://img.shields.io/badge/Tests-170%20passed-success?style=flat-square)](#)
+[![FastAPI](https://img.shields.io/badge/FastAPI-0.100%2B-009688?style=flat-square)](https://fastapi.tiangolo.com)
+[![Streamlit](https://img.shields.io/badge/Streamlit-1.36%2B-FF4B4B?style=flat-square)](https://streamlit.io)
+[![License](https://img.shields.io/badge/License-MIT-blue?style=flat-square)](LICENSE)
+[![CodeQL](https://img.shields.io/badge/CodeQL-enabled-0E4F88?style=flat-square&logo=github)](.github/workflows/codeql.yml)
 
 </div>
 
@@ -18,25 +20,38 @@ A comprehensive **text autocomplete system** that demonstrates multiple approach
 ## Features
 
 ### 🧠 Language Models
-- **N-gram Model** — Bigram through 4-gram with backoff smoothing and configurable frequency thresholding
-- **Markov Chain Model** — First-order Markov chain with Laplace smoothing, text generation, and transition visualization
-- **LSTM Neural Model** — PyTorch-based LSTM for next-token prediction (with graceful mock fallback)
+All three models implement the same `fit(tokens)` / `predict_next(context, top_k)` contract so they are interchangeable behind the beam-search decoder and the API.
+- **N-gram Model** — Unigram through 4-gram with **backoff** *and* **interpolation** smoothing, configurable min-frequency pruning, and JSON save/load
+- **Markov Chain Model** — First-order Markov chain with Laplace smoothing, temperature-controlled text generation, and transition inspection
+- **LSTM Neural Model** — PyTorch LSTM (word-level, CUDA-aware) with a deterministic mock fallback when torch isn't installed
 
 ### 🔍 Advanced Decoding
-- **Beam Search** — Multi-hypothesis decoding with length penalty, configurable beam width and search depth
+- **Beam Search** — Multi-hypothesis decoding with length-normalized scoring (`score = log_prob / length^α`), configurable beam width and search depth
 
 ### 📏 Evaluation
 - **Perplexity** — Standard language model metric with interpretation guide
 - **Top-k Accuracy** — Measures prediction correctness at different ranking levels
 - **Prediction Diversity** — Detects trivial models that always predict the same word
 - **Vocabulary Coverage** — Measures what fraction of the vocabulary the model can predict
-- **Model Comparison** — Side-by-side evaluation of all models on identical test data
+- **Prediction Confidence** — Top-1 probability, Shannon entropy, and #1–#2 margin with a categorical `high`/`medium`/`low` label
+- **Model Comparison** — Side-by-side evaluation of all models on identical test data via `compare_models()`
 
-### 🚀 API
-- **Single Autocomplete** — `POST /autocomplete` with model selection (ngram/markov)
-- **Batch Autocomplete** — `POST /autocomplete/batch` for processing multiple texts
-- **Model Listing** — `GET /models` — discover available models
+### 📚 Data Pipeline
+- **Built-in Corpus** — `load_sample_data()` ships a curated teaching corpus
+- **File-based Corpus** — `load_corpus_from_file(path)` for training on your own text
+- **Unicode-safe Tokenizer** — NFKC normalization, smart-quote folding, optional stop-word removal
+- **Deterministic Train/Test Split** — seeded split for reproducible evaluation
+
+### 🚀 API (FastAPI, port 8010)
+- **Health Check** — `GET /health` — for load balancers and uptime monitoring
+- **Single Autocomplete** — `POST /autocomplete` with model selection (`ngram`/`markov`)
+- **Batch Autocomplete** — `POST /autocomplete/batch` for processing up to 50 texts per call
+- **Text Generation** — `POST /generate` with temperature control and optional seed for reproducibility
+- **Model Listing** — `GET /models` — discover available models and their parameters
 - **Vocabulary Stats** — `GET /vocab/stats` — corpus and model statistics
+- **Metrics** — `GET /metrics` — request counts, rate-limit hits, per-endpoint breakdown
+- **Rate Limiting** — token-bucket per client IP (30 burst, 2/s refill) with bounded-memory eviction
+- **Proxy-aware** — honours `X-Forwarded-For` only when `TRUST_FORWARDED_HEADERS=1` is set, to prevent spoofed-IP bucket minting
 - **Model Caching** — Trained models persist across requests for fast inference
 
 ### 📊 Streamlit Dashboard
@@ -49,9 +64,13 @@ A comprehensive **text autocomplete system** that demonstrates multiple approach
 ```bash
 git clone https://github.com/mohamed-elkholy95/text-autocomplete.git
 cd text-autocomplete
-pip install -r requirements.txt
-python -m pytest tests/ -v
-streamlit run streamlit_app/app.py
+pip install -r requirements.txt          # torch is optional — LSTM falls back to a mock if it's missing
+python -m pytest tests/ -v                # 170 tests across 8 files
+
+# Pick one frontend:
+streamlit run streamlit_app/app.py                              # interactive dashboard
+uvicorn src.api.main:app --host 0.0.0.0 --port 8010 --reload    # REST API
+python cli.py info                                              # command-line
 ```
 
 ## CLI Usage
@@ -59,20 +78,23 @@ streamlit run streamlit_app/app.py
 The project includes a full command-line interface for training, prediction, and evaluation:
 
 ```bash
-# Train and save an n-gram model
+# Train and save an n-gram model (with optional held-out evaluation)
 python cli.py train --model ngram --n 3 --save models/ngram_3.json --eval
 
-# Get autocomplete predictions
+# Train a Markov chain model
+python cli.py train --model markov --save models/markov.json
+
+# Get autocomplete predictions (visualised with probability bars)
 python cli.py predict --text "machine learning is" --top-k 5
 python cli.py predict --text "neural networks" --model markov
 
-# Load a saved model for faster predictions
+# Load a saved model for faster predictions (skips training)
 python cli.py predict --text "deep learning" --load models/ngram_3.json
 
-# Run full evaluation comparing both models
+# Run full evaluation comparing both models — prints a formatted report
 python cli.py eval --test-ratio 0.2
 
-# View corpus statistics and word frequencies
+# View corpus statistics and Zipf-style word frequencies
 python cli.py info
 ```
 
@@ -81,22 +103,23 @@ python cli.py info
 ```
 text-autocomplete/
 ├── src/
+│   ├── __init__.py        # Public API re-exports (models, evaluation, data utils)
 │   ├── config.py          # Central configuration & hyperparameters
-│   ├── data_loader.py     # Text loading, tokenization, train/test split
-│   ├── ngram_model.py     # N-gram LM with backoff smoothing
-│   ├── markov_model.py    # Markov chain LM with text generation
+│   ├── data_loader.py     # Corpus loading, Unicode normalization, tokenization, split
+│   ├── ngram_model.py     # N-gram LM with backoff + interpolation, JSON save/load
+│   ├── markov_model.py    # Markov chain LM with text generation, JSON save/load
 │   ├── beam_search.py     # Beam search decoder with length penalty
-│   ├── neural_model.py    # LSTM neural language model (PyTorch)
-│   ├── evaluation.py      # Comprehensive evaluation metrics
+│   ├── neural_model.py    # LSTM (PyTorch) with torch-optional mock fallback
+│   ├── evaluation.py      # Perplexity, accuracy, diversity, coverage, confidence, compare_models
 │   └── api/
-│       └── main.py        # FastAPI REST API
+│       └── main.py        # FastAPI REST API (rate-limited, metrics, model cache)
 ├── streamlit_app/
 │   ├── app.py             # Main Streamlit entry point
 │   └── pages/
 │       ├── 1_📊_Overview.py
 │       ├── 2_✍️_Autocomplete.py
 │       └── 3_📈_Metrics.py
-├── tests/
+├── tests/                  # 170 tests across 8 files
 │   ├── test_ngram.py
 │   ├── test_markov.py
 │   ├── test_beam_search.py
@@ -105,10 +128,16 @@ text-autocomplete/
 │   ├── test_evaluation.py
 │   ├── test_api.py
 │   └── test_integration.py   # End-to-end pipeline tests
-├── cli.py                     # Command-line interface
+├── cli.py                     # Command-line interface (train / predict / eval / info)
 ├── docs/
 │   ├── ARCHITECTURE.md        # System design & diagrams
 │   └── GLOSSARY.md            # NLP terminology reference
+├── .github/
+│   ├── workflows/ci.yml       # pytest on push/PR
+│   ├── workflows/codeql.yml   # CodeQL security scanning
+│   └── dependabot.yml         # Weekly pip + actions updates
+├── SECURITY.md                # Vulnerability disclosure policy
+├── LICENSE                    # MIT
 ├── requirements.txt
 └── README.md
 ```
@@ -194,12 +223,55 @@ resp = requests.get("http://localhost:8010/vocab/stats")
 
 # API metrics (request counts, rate limit stats)
 resp = requests.get("http://localhost:8010/metrics")
+
+# Health check (skipped by rate limiter — safe to poll)
+resp = requests.get("http://localhost:8010/health")
+```
+
+Interactive docs are available at `http://localhost:8010/docs` (Swagger UI) and `http://localhost:8010/redoc` once the server is running.
+
+### Deploying behind a proxy
+
+The rate limiter keys off `request.client.host` by default. If you run the API behind a trusted reverse proxy (nginx, Traefik, Cloudflare), set `TRUST_FORWARDED_HEADERS=1` so the left-most `X-Forwarded-For` entry is honoured. Do **not** enable this when the server is exposed directly — any client could otherwise spoof the header and mint a fresh rate-limit bucket per request.
+
+## Python API
+
+```python
+from src import (
+    NGramModel, MarkovChainModel, LSTMModel, BeamSearchDecoder,
+    tokenize, load_sample_data, train_test_split,
+    compute_perplexity, autocomplete_accuracy,
+    prediction_diversity, vocabulary_coverage,
+    prediction_confidence, compare_models,
+)
+
+tokens = tokenize(load_sample_data())
+train, test = train_test_split(tokens, test_ratio=0.2, seed=42)
+
+ngram = NGramModel(n=3).fit(train)
+markov = MarkovChainModel().fit(train)
+
+# Side-by-side comparison on identical data
+results = compare_models(
+    {"ngram": ngram, "markov": markov},
+    test_tokens=test,
+    context_tokens=["machine", "learning"],
+)
+
+# Confidence analysis on a single prediction
+conf = prediction_confidence(ngram.predict_next(["machine", "learning"], top_k=5))
+# -> {'top1_prob': ..., 'entropy': ..., 'margin': ..., 'confidence_level': 'high'|'medium'|'low'}
+
+# Multi-word completion via beam search (works with any model that has predict_next)
+decoder = BeamSearchDecoder(beam_width=5, max_length=5, length_penalty=0.6)
+beams = decoder.search(ngram, context_tokens=["machine", "learning"])
+# beams is a list of dicts sorted by score (best first), each with tokens, score, log_prob
 ```
 
 ## Running Tests
 
 ```bash
-# All tests (160+ across 8 test files)
+# All tests (170 across 8 test files)
 python -m pytest tests/ -v
 
 # Specific test file
@@ -208,6 +280,14 @@ python -m pytest tests/test_ngram.py -v
 # With coverage
 python -m pytest tests/ -v --cov=src
 ```
+
+## Security
+
+- **MIT licensed** — see [`LICENSE`](LICENSE)
+- **GitHub Advanced Security**: secret scanning + push protection, CodeQL (`security-and-quality` suite), Dependabot alerts on every push/PR to `main`
+- **CI**: pytest runs on push/PR with least-privilege permissions (`persist-credentials: false`, `contents: read`)
+- **Signed commits** required on `main` (branch-protected, squash-only, linear history)
+- **Vulnerability disclosure** — see [`SECURITY.md`](SECURITY.md)
 
 ## Author
 
