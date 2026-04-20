@@ -21,3 +21,4 @@ metrics/
 .vscode/
 CLAUDE.local.md
 .claude/
+.envrc

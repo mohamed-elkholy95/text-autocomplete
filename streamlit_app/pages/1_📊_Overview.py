@@ -11,7 +11,10 @@ import streamlit as st
 import plotly.express as px
 import numpy as np
 
-from src.data_loader import tokenize, load_sample_data, get_corpus_stats
+from src.data_loader import tokenize, load_sample_data, get_corpus_stats, train_test_split
+from src.ngram_model import NGramModel
+from src.markov_model import MarkovChainModel
+from src.evaluation import autocomplete_accuracy
 
 st.title("📊 Text Autocomplete — Overview")
 st.markdown("""
@@ -113,16 +116,45 @@ with col2:
 # ---------------------------------------------------------------------------
 st.header("📊 Model Comparison")
 
-# Simulated accuracy data based on model characteristics
-# In a real app, this would come from actual evaluation runs
-models = ["Unigram\n(baseline)", "Bigram", "Trigram", "4-gram", "Markov\nChain"]
-accuracies = [25, 38, 48, 35, 42]
+@st.cache_data(show_spinner=False)
+def _compute_top1_accuracies() -> dict:
+    """Run the same 80/20 split evaluation used elsewhere and return
+    real top-1 accuracies for each model so this chart isn't illustrative."""
+    corpus_tokens = tokenize(load_sample_data())
+    train_tokens, test_tokens = train_test_split(corpus_tokens, test_ratio=0.2, seed=42)
+
+    models_to_eval = {
+        "Unigram\n(baseline)": NGramModel(n=1, min_freq=1).fit(train_tokens),
+        "Bigram": NGramModel(n=2, min_freq=1).fit(train_tokens),
+        "Trigram": NGramModel(n=3, min_freq=2).fit(train_tokens),
+        "4-gram": NGramModel(n=4, min_freq=2).fit(train_tokens),
+        "Markov\nChain": MarkovChainModel().fit(train_tokens),
+    }
+
+    out: dict = {}
+    max_probe = min(len(test_tokens) - 1, 500)
+    for label, mdl in models_to_eval.items():
+        preds_list, truth_list = [], []
+        ctx_len = (mdl.n - 1) if isinstance(mdl, NGramModel) else 1
+        start = max(ctx_len, 1)
+        for i in range(start, max_probe):
+            ctx = test_tokens[i - ctx_len:i]
+            truth = test_tokens[i]
+            preds = mdl.predict_next(ctx, top_k=1)
+            preds_list.append([w for w, _ in preds])
+            truth_list.append(truth)
+        out[label] = round(autocomplete_accuracy(preds_list, truth_list, top_k=1) * 100, 1)
+    return out
+
+acc_map = _compute_top1_accuracies()
+models = list(acc_map.keys())
+accuracies = list(acc_map.values())
 
 fig = px.bar(
     x=models,
     y=accuracies,
     labels={"x": "Model", "y": "Top-1 Accuracy (%)"},
-    title="Model Accuracy Comparison (on held-out test data)",
+    title="Top-1 Accuracy on Held-Out Test Split (real numbers, computed at load)",
     color=accuracies,
     color_continuous_scale="Blues",
     text=accuracies,
@@ -133,7 +165,7 @@ fig.update_layout(
     plot_bgcolor="#262730",
     font_color="white",
     showlegend=False,
-    yaxis_range=[0, 60],
+    yaxis_range=[0, max(accuracies) * 1.4 if accuracies else 60],
 )
 fig.update_xaxes(tickfont={"size": 11})
 st.plotly_chart(fig, use_container_width=True)

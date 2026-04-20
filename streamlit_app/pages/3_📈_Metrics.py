@@ -246,11 +246,10 @@ if st.button("🔍 Analyze Predictions", use_container_width=True):
             )
             st.plotly_chart(fig2, use_container_width=True)
 
-        # Diversity analysis
-        all_predictions = [ngram_preds, markov_preds]
-        for name, preds in zip(["N-gram", "Markov"], all_predictions):
-            div = prediction_diversity([list(p[0] for p in [preds])] * 5)  # simplified
-            unique_words = len(set(w for w, _ in preds))
+        # Diversity analysis — count how many distinct words each model
+        # surfaced for this context (a rough per-context diversity signal).
+        for name, preds in zip(["N-gram", "Markov"], [ngram_preds, markov_preds]):
+            unique_words = len({w for w, _ in preds})
             st.metric(f"{name} — Unique predictions", unique_words)
 
 # ---------------------------------------------------------------------------

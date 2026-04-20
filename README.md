@@ -5,7 +5,7 @@
 **N-gram, Markov Chain & Beam Search language models** for text completion with perplexity evaluation
 
 [![Python](https://img.shields.io/badge/Python-3.12-3776AB?style=flat-square&logo=python)](https://python.org)
-[![Tests](https://img.shields.io/badge/Tests-77%2B%20passed-success?style=flat-square)](#)
+[![Tests](https://img.shields.io/badge/Tests-160%2B%20passed-success?style=flat-square)](#)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.100-009688?style=flat-square)](https://fastapi.tiangolo.com)
 [![Streamlit](https://img.shields.io/badge/Streamlit-1.28-FF4B4B?style=flat-square)](https://streamlit.io)
 
@@ -199,7 +199,7 @@ resp = requests.get("http://localhost:8010/metrics")
 ## Running Tests
 
 ```bash
-# All tests (77+ across 8 test files)
+# All tests (160+ across 8 test files)
 python -m pytest tests/ -v
 
 # Specific test file

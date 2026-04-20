@@ -87,7 +87,7 @@ class BeamSearchDecoder:
     def _length_normalized_score(self, log_prob: float, length: int) -> float:
         """Compute length-normalized log probability score.
 
-        WHY LENGTH NORMALIALIZATION?
+        WHY LENGTH NORMALIZATION?
         Without it, beam search strongly prefers shorter sequences because:
         - Each additional token multiplies by a probability < 1.0
         - So log_prob gets more negative with each step
