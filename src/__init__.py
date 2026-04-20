@@ -40,8 +40,9 @@ Example:
 from src.ngram_model import NGramModel
 from src.markov_model import MarkovChainModel
 from src.neural_model import LSTMModel
+from src.transformer_model import TransformerModel
 from src.beam_search import BeamSearchDecoder
-from src.data_loader import tokenize, load_sample_data, train_test_split
+from src.data_loader import tokenize, load_sample_data, load_wikitext, train_test_split
 from src.evaluation import (
     compute_perplexity,
     autocomplete_accuracy,
@@ -58,10 +59,12 @@ __all__ = [
     "NGramModel",
     "MarkovChainModel",
     "LSTMModel",
+    "TransformerModel",
     "BeamSearchDecoder",
     # Data utilities
     "tokenize",
     "load_sample_data",
+    "load_wikitext",
     "train_test_split",
     # Evaluation
     "compute_perplexity",
