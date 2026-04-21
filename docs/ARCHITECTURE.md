@@ -120,15 +120,45 @@ tied-weight output` (Press & Wolf 2016). The projection layer lets
 `hidden_dim` and `embed_dim` diverge without breaking tying. Training
 supports `vocab_cap` (top-N frequent tokens; rest collapse to `<unk>`),
 gradient clipping, a cosine LR schedule, `bfloat16` autocast on CUDA,
-and opt-in `torch.compile`. Perplexity is computed via token-level
-cross-entropy (`LSTMModel.perplexity()`) so the evaluation driver can
-compare all three model families head-to-head. Checkpoints persist as
-a `safetensors` weights file plus a JSON metadata sidecar at
-`schema_version=2`; older bundles refuse to load rather than
-silently breaking on the missing tied layer. Torch itself is an
-*optional* dependency — when it's not installed, `HAS_TORCH=False` and
-the module returns deterministic mock outputs so `pytest` stays green
-on a minimal install.
+opt-in `torch.compile`, opt-in stateful BPTT (hidden state carried
+across `seq_len` windows, detached between them), and an optional
+external `BPETokenizer` for subword training. Perplexity is computed
+via token-level cross-entropy (`LSTMModel.perplexity()`) so the
+evaluation driver can compare all four model families head-to-head.
+Checkpoints persist as a `safetensors` weights file plus a JSON
+metadata sidecar; word-level bundles use `schema_version=2`, subword
+bundles bump to `schema_version=3` with the tokenizer identity captured
+in meta. Older bundles refuse to load rather than silently breaking.
+Torch itself is an *optional* dependency — when it's not installed,
+`HAS_TORCH=False` and the module returns deterministic mock outputs so
+`pytest` stays green on a minimal install.
+
+**Decoder-only Transformer (`src/transformer_model.py`).**
+`Embedding (tied) + learned absolute positional embedding → N pre-norm
+decoder blocks (causal multi-head self-attention + GELU MLP) →
+LayerNorm → tied LM head`. Same `fit` / `predict_next` / `perplexity`
+contract as the LSTM so `compute_perplexity` and the beam-search
+decoder stay model-agnostic; `vocab_cap` + `<unk>` + BPE-tokenizer
+wiring all mirror the LSTM. Training uses AdamW with weight decay
+0.01, a cosine LR schedule, and `bfloat16` autocast on CUDA. No
+stateful-BPTT option — transformers attend directly, so there's no
+hidden state to carry. Checkpoints persist identically (safetensors
++ JSON); word-level is `schema_version=1`, subword bumps to
+`schema_version=2`. The transformer and LSTM version their schemas
+independently because their state-dict layouts evolve separately.
+On the full WikiText-2 benchmark it beats the LSTM on perplexity
+(−24 %) and top-5 accuracy (+4 pp) with half the training time — see
+the README for the measured numbers.
+
+**Subword Tokenizer (`src/bpe_tokenizer.py`).**
+`BPETokenizer` wraps `transformers.AutoTokenizer` (SmolLM2's ~49 k
+byte-level BPE by default) and exposes the minimal `encode` / `decode`
+/ `vocab_size` / `unk_id` / `name` surface the neural models need.
+Passing `tokenizer=` to `LSTMModel.fit` or `TransformerModel.fit`
+replaces the word-level vocab with BPE subword ids; callers that don't
+want BPE don't need to install `transformers` at all. The tokenizer
+identity is captured in the saved meta so reloaded checkpoints
+re-instantiate the same tokenizer automatically.
 
 ### 3.3 Beam Search Decoder — `src/beam_search.py`
 
