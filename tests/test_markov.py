@@ -136,6 +136,7 @@ class TestMarkovGenerate:
         text2 = trained_model.generate_text(seed=42, max_length=10, temperature=0.1)
         # With same seed and low temperature, should be deterministic
         assert isinstance(text1, str)
+        assert text1 == text2
 
     def test_generate_not_fitted(self):
         model = MarkovChainModel()

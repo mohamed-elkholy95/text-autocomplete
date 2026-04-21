@@ -1,6 +1,5 @@
 """Tests for the data loader module."""
 
-import pytest
 from src.data_loader import (
     load_sample_data,
     tokenize,
@@ -8,7 +7,6 @@ from src.data_loader import (
     generate_synthetic_data,
     train_test_split,
     get_corpus_stats,
-    _remove_stopwords,
 )
 
 
@@ -68,7 +66,6 @@ class TestTokenize:
         assert tokens == ["hello"]
 
     def test_remove_stopwords(self):
-        tokens_with = tokenize("the cat is on the mat")
         tokens_without = tokenize("the cat is on the mat", remove_stopwords=True)
         # Without stopwords, "the", "is", "on" should be removed
         assert "the" not in tokens_without

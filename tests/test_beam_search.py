@@ -49,7 +49,6 @@ class TestBeamSearchScoring:
     def test_penalty_effects(self):
         """Different penalty values should produce different scores."""
         decoder_low = BeamSearchDecoder(length_penalty=0.3)
-        decoder_high = BeamSearchDecoder(length_penalty=1.5)
 
         log_prob = -5.0
         length = 10
