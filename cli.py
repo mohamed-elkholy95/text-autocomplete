@@ -263,6 +263,23 @@ def cmd_eval(args: argparse.Namespace) -> None:
             )
             models.append(("LSTM", lstm, max((args.n or 3) - 1, 1)))
 
+    if args.include_transformer:
+        if not HAS_TORCH:
+            print("⚠️  --include-transformer requested but PyTorch is not installed; skipping.")
+        else:
+            print(f"🔧 Training Transformer ({args.transformer_epochs} epoch(s))...")
+            xformer = TransformerModel(
+                d_model=64, n_heads=4, n_layers=2, ff_dim=128, max_seq_len=64,
+            )
+            xformer.fit(
+                train_tokens,
+                epochs=args.transformer_epochs,
+                seq_len=min(32, max(len(train_tokens) // 4, 4)),
+                batch_size=32,
+                lr=3e-4,
+            )
+            models.append(("Transformer", xformer, max((args.n or 3) - 1, 1)))
+
     predictions: "dict[str, list[list[str]]]" = {name: [] for name, _, _ in models}
     ground_truth: "list[str]" = []
 
@@ -285,7 +302,9 @@ def cmd_eval(args: argparse.Namespace) -> None:
         }
 
     names = [name for name, _, _ in models]
-    col_w = 12
+    # Widen columns enough that long model names ("Transformer") and
+    # huge perplexity values from undertrained models don't collide.
+    col_w = max(13, max(len(n) for n in names) + 2)
     header = f"{'Metric':<30}" + "".join(f"{name:>{col_w}}" for name in names)
     print("\n" + "=" * len(header))
     print("          TEXT AUTOCOMPLETE — EVALUATION REPORT")
@@ -302,7 +321,13 @@ def cmd_eval(args: argparse.Namespace) -> None:
         row = f"{label:<30}"
         for name in names:
             v = per_model[name][key]
-            row += f"{v:>{col_w}.2%}" if pct else f"{v:>{col_w}.2f}"
+            if pct:
+                cell = f"{v:.2%}"
+            elif v > 1e6:
+                cell = f"{v:.2e}"  # huge PPL from undertrained runs → scientific
+            else:
+                cell = f"{v:.2f}"
+            row += f"{cell:>{col_w}}"
         print(row)
     print("-" * len(header))
 
@@ -459,6 +484,14 @@ Examples:
     eval_parser.add_argument(
         "--lstm-epochs", type=int, default=3,
         help="Training epochs when --include-lstm is passed (default: 3).",
+    )
+    eval_parser.add_argument(
+        "--include-transformer", action="store_true",
+        help="Also train and report a decoder-only transformer (requires PyTorch).",
+    )
+    eval_parser.add_argument(
+        "--transformer-epochs", type=int, default=3,
+        help="Training epochs when --include-transformer is passed (default: 3).",
     )
 
     # --- info subcommand ---
