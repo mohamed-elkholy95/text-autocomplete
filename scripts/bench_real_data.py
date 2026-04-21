@@ -26,12 +26,22 @@ sys.path.insert(0, str(ROOT))
 from src.data_loader import tokenize, train_test_split, get_corpus_stats
 from src.ngram_model import NGramModel
 from src.markov_model import MarkovChainModel
+from src.neural_model import LSTMModel, HAS_TORCH
 from src.evaluation import (
     autocomplete_accuracy,
     prediction_diversity,
     vocabulary_coverage,
     compute_perplexity,
 )
+
+LSTM_EMBED_DIM = 128
+LSTM_HIDDEN_DIM = 256
+LSTM_NUM_LAYERS = 2
+LSTM_VOCAB_CAP = 20000
+LSTM_EPOCHS = 10
+LSTM_SEQ_LEN = 64
+LSTM_BATCH_SIZE = 64
+LSTM_LR = 1e-3
 
 CACHE_DIR = ROOT / "data" / "wikitext2"
 CORPUS_PATH = CACHE_DIR / "wikitext2_train.txt"
@@ -63,8 +73,12 @@ def eval_stat_model(model, train_tokens, test_tokens, *, n_probe: int = 1000, to
     """Compute perplexity + top-k accuracy/diversity/coverage on a slice."""
     ppl = compute_perplexity(model, test_tokens)
 
-    ctx_len = getattr(model, "n", 2) - 1 if isinstance(model, NGramModel) else 1
-    ctx_len = max(ctx_len, 1)
+    if isinstance(model, NGramModel):
+        ctx_len = max(model.n - 1, 1)
+    elif isinstance(model, LSTMModel):
+        ctx_len = 5  # same probe window as the SmolLM2 row — gives the LSTM a fair shot
+    else:
+        ctx_len = 1
 
     preds, truth = [], []
     probe_end = min(len(test_tokens) - 1, ctx_len + n_probe)
@@ -117,14 +131,41 @@ def run_slm_demo():
         print(f"  '{prompt}'\n    → {new!r}   ({dt*1000:.0f} ms)")
 
 
+def train_lstm_full(train: list[str]) -> LSTMModel:
+    """Train the LSTM on the full WikiText-2 train split.
+
+    Uses the PR 1 + PR 2 + PR 10 stack: batched training, gradient clipping,
+    cosine LR, bf16 autocast, weight tying, vocab cap, stateful BPTT. This
+    is the benchmark that was missing — the 200k-subset numbers in the
+    README were deliberately under-trained; this run burns the 10–20 min
+    of GPU time needed to see what the architecture actually can do.
+    """
+    model = LSTMModel(
+        embed_dim=LSTM_EMBED_DIM,
+        hidden_dim=LSTM_HIDDEN_DIM,
+        num_layers=LSTM_NUM_LAYERS,
+        dropout=0.3,
+        vocab_cap=LSTM_VOCAB_CAP,
+    )
+    model.fit(
+        train,
+        epochs=LSTM_EPOCHS,
+        seq_len=LSTM_SEQ_LEN,
+        batch_size=LSTM_BATCH_SIZE,
+        lr=LSTM_LR,
+        stateful=True,
+    )
+    return model
+
+
 def main():
     print(f"project: {ROOT}")
-    print("\n[1/3] Fetching WikiText-2 raw train split…")
+    print("\n[1/4] Fetching WikiText-2 raw train split…")
     t0 = time.perf_counter()
     text = fetch_wikitext2()
     print(f"    cache: {CORPUS_PATH}  ({len(text):,} chars, {time.perf_counter()-t0:.1f}s)")
 
-    print("\n[2/3] Tokenize + train n-gram (n=3) and Markov chain on real data.")
+    print("\n[2/4] Tokenize + train n-gram (n=3) and Markov chain on real data.")
     tokens = tokenize(text)
     print("     corpus:", get_corpus_stats(tokens))
     train, test = train_test_split(tokens, test_ratio=0.1, seed=42)
@@ -148,11 +189,23 @@ def main():
                 f"top1={m['top1_acc']:6.2%}  top5={m['top5_acc']:6.2%}  "
                 f"div={m['diversity']:6.2%}  cov={m['coverage']:6.2%}")
 
-    print("\n     ── metrics on WikiText-2 test slice ──")
+    print("\n     ── statistical models ──")
     print(row("ngram", ng_metrics))
     print(row("markov", mk_metrics))
 
-    print("\n[3/3] Small language model baseline.")
+    print("\n[3/4] Train LSTM on full corpus (this takes minutes, not seconds).")
+    if HAS_TORCH:
+        t0 = time.perf_counter()
+        lstm = train_lstm_full(train)
+        lstm_fit = time.perf_counter() - t0
+        print(f"     lstm fit: {lstm_fit:.1f}s (vocab={lstm.vocab_size})")
+        lstm_metrics = eval_stat_model(lstm, train, test, n_probe=1000)
+        print("\n     ── neural model ──")
+        print(row("lstm", lstm_metrics))
+    else:
+        print("     torch not available; skipping LSTM row.")
+
+    print("\n[4/4] Small language model baseline.")
     try:
         run_slm_demo()
     except Exception as e:
