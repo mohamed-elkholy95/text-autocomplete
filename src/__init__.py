@@ -11,6 +11,7 @@ Models:
     NGramModel          — N-gram language model with backoff and interpolation
     MarkovChainModel    — First-order Markov chain with Laplace smoothing
     LSTMModel           — Optional PyTorch LSTM (word-level fit/predict_next)
+    TransformerModel    — Optional PyTorch decoder-only transformer (same contract)
 
 Decoding:
     BeamSearchDecoder   — Multi-hypothesis beam search for better predictions
@@ -40,6 +41,7 @@ Example:
 from src.ngram_model import NGramModel
 from src.markov_model import MarkovChainModel
 from src.neural_model import LSTMModel
+from src.transformer_model import TransformerModel
 from src.beam_search import BeamSearchDecoder
 from src.data_loader import tokenize, load_sample_data, train_test_split
 from src.evaluation import (
@@ -58,6 +60,7 @@ __all__ = [
     "NGramModel",
     "MarkovChainModel",
     "LSTMModel",
+    "TransformerModel",
     "BeamSearchDecoder",
     # Data utilities
     "tokenize",
