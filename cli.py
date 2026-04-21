@@ -29,7 +29,6 @@ Usage:
 """
 
 import argparse
-import json
 import sys
 import time
 from pathlib import Path
@@ -52,7 +51,6 @@ from src.evaluation import (
     autocomplete_accuracy,
     prediction_diversity,
     vocabulary_coverage,
-    generate_report,
 )
 
 

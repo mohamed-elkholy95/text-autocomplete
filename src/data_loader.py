@@ -27,11 +27,11 @@ choice of model architecture. This module demonstrates several key concepts:
 import logging
 import re
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 
 import numpy as np
 
-from src.config import RANDOM_SEED, DATA_DIR
+from src.config import RANDOM_SEED
 
 logger = logging.getLogger(__name__)
 

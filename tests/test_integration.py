@@ -40,9 +40,6 @@ from src.markov_model import MarkovChainModel
 from src.beam_search import BeamSearchDecoder
 from src.evaluation import (
     compute_perplexity,
-    autocomplete_accuracy,
-    prediction_diversity,
-    vocabulary_coverage,
     compare_models,
     generate_report,
 )
