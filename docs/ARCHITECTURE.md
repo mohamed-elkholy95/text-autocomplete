@@ -275,7 +275,7 @@ text-autocomplete/
 │   └── api/
 │       └── main.py          # FastAPI app, middleware, endpoints
 ├── streamlit_app/           # Overview / Autocomplete / Metrics pages
-├── tests/                   # 8 test files, 77+ tests
+├── tests/                   # 8 test files, 170 tests
 ├── cli.py                   # train | predict | eval | info
 ├── docs/
 │   ├── ARCHITECTURE.md      # This file
