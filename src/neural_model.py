@@ -283,7 +283,7 @@ class LSTMModel(nn.Module if HAS_TORCH else object):
 def train_lstm(
     model: Any, tokens: List[int], vocab_size: int, epochs: int = 5,
     seq_len: int = 20, batch_size: int = 32, lr: float = 1e-3,
-    grad_clip: float = 1.0,
+    grad_clip: float = 1.0, use_amp: bool = True,
 ) -> Dict[str, List[float]]:
     """Train the LSTM language model on a flat token stream.
 
@@ -296,6 +296,11 @@ def train_lstm(
     Training hygiene: gradient clipping keeps the LSTM stable over
     multi-epoch runs; a cosine LR schedule decays the Adam learning rate
     from ``lr`` to zero across ``epochs``.
+
+    Mixed precision: when ``use_amp`` is True and the device is CUDA,
+    the forward + loss run under ``torch.autocast(dtype=bfloat16)``.
+    bfloat16 has fp32's exponent range, so no loss scaler is needed; the
+    tied-embedding checkpoint is still stored in fp32 on disk.
     """
     if not HAS_TORCH or not isinstance(model, nn.Module):
         logger.info("Mock training")
@@ -308,6 +313,7 @@ def train_lstm(
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(epochs, 1))
     criterion = nn.CrossEntropyLoss()
     history: Dict[str, List[float]] = {"loss": [], "perplexity": [], "lr": []}
+    amp_enabled = bool(use_amp and device.type == "cuda" and torch.cuda.is_bf16_supported())
 
     # Reshape the flat stream into `batch_size` parallel rows. Rows that
     # don't fit cleanly into `n_steps` tokens are dropped — typical LM
@@ -332,8 +338,9 @@ def train_lstm(
             x = data[:, i:i+seq_len]
             y = data[:, i+1:i+seq_len+1]
             optimizer.zero_grad()
-            logits = model(x)
-            loss = criterion(logits.reshape(-1, vocab_size), y.reshape(-1))
+            with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=amp_enabled):
+                logits = model(x)
+                loss = criterion(logits.reshape(-1, vocab_size), y.reshape(-1))
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
             optimizer.step()
@@ -348,8 +355,9 @@ def train_lstm(
         history["perplexity"].append(round(float(ppl), 4))
         history["lr"].append(round(current_lr, 6))
         logger.info(
-            "LSTM Epoch %d/%d: loss=%.4f ppl=%.1f lr=%.2e batch=%d",
+            "LSTM Epoch %d/%d: loss=%.4f ppl=%.1f lr=%.2e batch=%d amp=%s",
             epoch + 1, epochs, avg, ppl, current_lr, effective_batch,
+            "bf16" if amp_enabled else "off",
         )
 
     return history

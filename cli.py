@@ -103,6 +103,7 @@ def cmd_train(args: argparse.Namespace) -> None:
             embed_dim=args.embed_dim,
             hidden_dim=args.hidden_dim,
             num_layers=args.num_layers,
+            vocab_cap=args.vocab_cap,
         )
         model.fit(
             train_tokens,
@@ -329,6 +330,11 @@ Examples:
     train_parser.add_argument("--embed-dim", type=int, default=64, help="LSTM: embedding dim (default: 64)")
     train_parser.add_argument("--hidden-dim", type=int, default=128, help="LSTM: hidden dim (default: 128)")
     train_parser.add_argument("--num-layers", type=int, default=2, help="LSTM: number of layers (default: 2)")
+    train_parser.add_argument(
+        "--vocab-cap", type=int, default=None,
+        help="LSTM: cap vocab at top-N most frequent tokens; rest map to <unk>. "
+             "Default None = keep every token.",
+    )
 
     # --- predict subcommand ---
     pred_parser = subparsers.add_parser("predict", help="Get autocomplete predictions")
