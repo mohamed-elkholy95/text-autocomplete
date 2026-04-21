@@ -266,8 +266,15 @@ What this project does *not* do, flagged so nobody is surprised:
 - **Per-process state.** Rate-limit buckets and model caches live in
   module globals. Run two uvicorn workers and you get two caches, two
   independently-refilling buckets per IP, and no shared metrics.
-  Production fix: Redis for buckets/metrics, and either a shared model
-  artifact on disk or a model server (TorchServe, Triton, Ray Serve).
+  - *Rate limiter:* optional Redis backend is wired in. Set
+    `REDIS_URL=redis://host:6379` and install the `redis` package and
+    every worker shares one fixed-window counter per IP. Unset, the
+    in-memory token bucket keeps running.
+  - *Model cache:* best handled by (a) warming at startup — already done
+    for the count-based models via the `lifespan` hook — and (b) sharing
+    neural weights across workers via the `AUTOCOMPLETE_*_CHECKPOINT_*`
+    env vars. Redis is the wrong tool here: models are live Python
+    objects, not bytes.
 - **No authentication.** Every endpoint is public. A real deployment would
   sit behind API-key auth, OAuth, or an API gateway.
 - **CORS wildcard.** `allow_origins=["*"]` is fine for a demo. In
@@ -278,10 +285,14 @@ What this project does *not* do, flagged so nobody is surprised:
   artefact, not a model bug — swap in WikiText-103 or Gutenberg and the
   numbers collapse into the 50–300 range. Top-k accuracy and diversity
   are the better signals on this corpus.
-- **No observability beyond log lines.** `/metrics` is a hand-rolled
-  counter, not Prometheus. A real deployment would export structured
-  metrics (requests, latency histograms, cache hit ratio) to a time-series
-  backend.
+- **Observability: two endpoints, two audiences.** `/metrics` returns a
+  hand-rolled JSON summary — small enough to read in one screen and used
+  by the Streamlit Metrics page. When the optional
+  `prometheus-fastapi-instrumentator` package is installed, `/metrics/prom`
+  additionally serves Prometheus text format (counters + latency
+  histograms) for Grafana / Alertmanager scrapes. A real deployment would
+  keep just the Prometheus path; this repo keeps both for the teaching
+  contrast.
 
 ---
 

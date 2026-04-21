@@ -31,6 +31,7 @@ import logging
 import os
 import time
 from collections import defaultdict
+from contextlib import asynccontextmanager
 from typing import Annotated, Dict, List, Optional
 
 from fastapi import FastAPI, HTTPException, Request
@@ -43,11 +44,91 @@ from src.config import API_TITLE, API_VERSION, TOP_K
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
+# Optional observability + distributed-state dependencies
+# ---------------------------------------------------------------------------
+# Both blocks follow the same "optional dependency" pattern used for torch
+# and transformers: import guarded, feature flag exposed, everything still
+# works on a minimal install.
+#
+# 1. prometheus-fastapi-instrumentator exposes a proper Prometheus scrape
+#    endpoint at /metrics/prom. The hand-rolled JSON /metrics stays — the
+#    two coexist so learners can compare "what I built" against "what the
+#    ecosystem ships".
+# 2. redis is used to share the rate-limit state across uvicorn workers
+#    when REDIS_URL is set. Without it, the in-memory token bucket keeps
+#    working (fine for a single-worker demo).
+
+try:
+    from prometheus_fastapi_instrumentator import Instrumentator
+    HAS_PROMETHEUS = True
+except ImportError:
+    HAS_PROMETHEUS = False
+
+try:
+    import redis.asyncio as aioredis
+    HAS_REDIS = True
+except ImportError:
+    HAS_REDIS = False
+
+# Populated by the lifespan hook when REDIS_URL is set AND redis is
+# installed. Stays None otherwise, which flips _check_rate_limit back to
+# the in-memory bucket.
+_redis_client = None  # type: ignore[var-annotated]
+
+# ---------------------------------------------------------------------------
+# Lifespan — startup / shutdown hook
+# ---------------------------------------------------------------------------
+# FastAPI runs this async context once at process start (before the first
+# request) and once at shutdown. Two jobs:
+#   1. Warm the cheap models so the first real request isn't a cold train.
+#   2. Connect to Redis if REDIS_URL is set — used by the rate limiter to
+#      share state across workers. A failed connect is logged and the API
+#      falls back to in-memory limiting; we don't abort boot for it.
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Preload the two count-based models (both fit in ~tens of ms on the
+    # sample corpus). Neural models stay lazy — they're larger and the
+    # "torch optional" anchor means we can't assume they're importable.
+    try:
+        _get_trained_ngram()
+        _get_trained_markov()
+    except Exception as exc:  # pragma: no cover — defensive
+        logger.warning("Model preload skipped: %s", exc)
+
+    # Redis rate-limit backend (opt-in).
+    global _redis_client
+    redis_url = os.getenv("REDIS_URL")
+    if redis_url and HAS_REDIS:
+        try:
+            _redis_client = aioredis.from_url(redis_url, decode_responses=True)
+            await _redis_client.ping()
+            logger.info("Redis rate-limit backend active at %s", redis_url)
+        except Exception as exc:
+            logger.warning(
+                "Redis connect failed (%s); falling back to in-memory rate limit.",
+                exc,
+            )
+            _redis_client = None
+    elif redis_url and not HAS_REDIS:
+        logger.warning(
+            "REDIS_URL set but 'redis' package not installed — "
+            "using in-memory rate limit instead."
+        )
+
+    yield
+
+    if _redis_client is not None:
+        await _redis_client.aclose()
+
+
+# ---------------------------------------------------------------------------
 # App Initialization
 # ---------------------------------------------------------------------------
 app = FastAPI(
     title=API_TITLE,
     version=API_VERSION,
+    lifespan=lifespan,
     description="""
     Text Autocomplete API — Get real-time word completion suggestions.
 
@@ -95,7 +176,49 @@ RATE_LIMIT_MAX_BUCKETS = 10_000
 _rate_buckets: Dict[str, Dict] = {}
 
 
-def _check_rate_limit(client_ip: str) -> bool:
+async def _check_rate_limit(client_ip: str) -> bool:
+    """Dispatch to the Redis limiter if it's connected, else in-memory.
+
+    Kept async because the Redis path awaits network I/O. The memory
+    path is still sync under the hood — we just return its result.
+    """
+    if _redis_client is not None:
+        return await _check_rate_limit_redis(client_ip)
+    return _check_rate_limit_memory(client_ip)
+
+
+# Redis key layout: one counter per (IP, window). INCR is atomic, so
+# two workers racing on the same key still share one bucket. We use a
+# fixed-window counter (simpler than a full token bucket) with the same
+# budget — 30 requests per 15 s — as the in-memory limiter's steady state.
+_RATE_LIMIT_WINDOW_SECONDS = 15
+_RATE_LIMIT_WINDOW_BUDGET = 30
+
+
+async def _check_rate_limit_redis(client_ip: str) -> bool:
+    """Fixed-window limiter backed by Redis INCR + EXPIRE.
+
+    The teaching contrast with the in-memory token bucket: here the state
+    lives outside the process, so every uvicorn worker sees the same
+    counter. That's exactly what the in-memory bucket *can't* give you
+    once you scale beyond one worker. If Redis errors, we fail-open
+    (allow the request) rather than locking everyone out — the API
+    should survive a flaky cache.
+    """
+    try:
+        window = int(time.time() // _RATE_LIMIT_WINDOW_SECONDS)
+        key = f"ratelimit:{client_ip}:{window}"
+        count = await _redis_client.incr(key)
+        if count == 1:
+            # First hit in this window — set the TTL so the key expires.
+            await _redis_client.expire(key, _RATE_LIMIT_WINDOW_SECONDS)
+        return count <= _RATE_LIMIT_WINDOW_BUDGET
+    except Exception as exc:
+        logger.warning("Redis rate-limit check failed, failing open: %s", exc)
+        return True
+
+
+def _check_rate_limit_memory(client_ip: str) -> bool:
     """Check if a client has remaining rate limit tokens.
 
     Returns True if the request is allowed, False if rate-limited. The
@@ -187,6 +310,15 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Prometheus instrumentation (optional). When the package is installed,
+# every route gets automatic counters + latency histograms emitted in
+# Prometheus text format at /metrics/prom. The hand-rolled JSON /metrics
+# below stays put — it's a small learning surface for "what's inside a
+# metrics endpoint". Prometheus uses a parallel path at /metrics/prom so
+# the two don't collide.
+if HAS_PROMETHEUS:
+    Instrumentator().instrument(app).expose(app, endpoint="/metrics/prom")
+
 
 @app.middleware("http")
 async def rate_limit_and_metrics_middleware(request: Request, call_next):
@@ -204,7 +336,7 @@ async def rate_limit_and_metrics_middleware(request: Request, call_next):
     client_ip = _resolve_client_ip(request)
 
     # Rate limit check (skip health endpoint to allow monitoring)
-    if request.url.path != "/health" and not _check_rate_limit(client_ip):
+    if request.url.path != "/health" and not await _check_rate_limit(client_ip):
         _request_metrics["rate_limited"] += 1
         logger.warning("Rate limited: %s on %s", client_ip, request.url.path)
         return JSONResponse(
@@ -862,11 +994,14 @@ async def generate_text(req: GenerateRequest):
 
 @app.get("/metrics")
 async def metrics():
-    """Get API usage metrics.
+    """Get API usage metrics (hand-rolled JSON format).
 
     Returns request counts, rate limit hits, and endpoint-level breakdowns.
-    In production, these would feed into a monitoring dashboard (Grafana,
-    DataDog) for alerting on anomalies like sudden traffic spikes.
+    Useful for quick human inspection and for the Streamlit Metrics page.
+
+    For a scrape-friendly format, install prometheus-fastapi-instrumentator
+    and hit /metrics/prom — that endpoint speaks the Prometheus exposition
+    format and adds latency histograms out of the box.
     """
     return {
         "total_requests": _request_metrics.get("total_requests", 0),

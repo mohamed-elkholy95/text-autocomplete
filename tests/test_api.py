@@ -1,7 +1,8 @@
 """Tests for the FastAPI endpoints."""
 
+import pytest
 from fastapi.testclient import TestClient
-from src.api.main import app
+from src.api.main import HAS_PROMETHEUS, HAS_REDIS, app
 
 client = TestClient(app)
 
@@ -411,3 +412,67 @@ class TestVocabStats:
         assert "ngram_vocab_size" in data
         assert "markov_vocab_size" in data
         assert data["corpus"]["total_tokens"] > 0
+
+
+class TestPrometheus:
+    """Prometheus exposition endpoint /metrics/prom.
+
+    Only runs when prometheus-fastapi-instrumentator is installed; the
+    package is optional so minimal installs skip cleanly.
+    """
+
+    def setup_method(self):
+        from src.api.main import _rate_buckets
+        _rate_buckets.clear()
+
+    @pytest.mark.skipif(not HAS_PROMETHEUS, reason="prometheus instrumentator not installed")
+    def test_prom_endpoint_returns_text_format(self):
+        # Generate one request so there's something to count.
+        client.post("/autocomplete", json={"text": "machine learning", "top_k": 3})
+        resp = client.get("/metrics/prom")
+        assert resp.status_code == 200
+        body = resp.text
+        assert body.startswith("# HELP") or body.startswith("# TYPE")
+        assert "http_requests_total" in body or "http_request_duration" in body
+
+    @pytest.mark.skipif(HAS_PROMETHEUS, reason="prometheus instrumentator is installed")
+    def test_prom_endpoint_absent_without_dep(self):
+        resp = client.get("/metrics/prom")
+        assert resp.status_code == 404
+
+
+class TestRedisRateLimit:
+    """Redis-backed rate limiter (opt-in via REDIS_URL).
+
+    We exercise the helper directly against fakeredis so there's no real
+    Redis dependency. The test is skipped when neither redis nor
+    fakeredis is available — which is the state on a minimal install.
+    """
+
+    def setup_method(self):
+        from src.api.main import _rate_buckets
+        _rate_buckets.clear()
+
+    @pytest.mark.skipif(not HAS_REDIS, reason="redis package not installed")
+    def test_redis_branch_shares_counter(self):
+        fakeredis = pytest.importorskip("fakeredis")
+        import asyncio
+        from src.api import main as api_main
+
+        api_main._redis_client = fakeredis.aioredis.FakeRedis(decode_responses=True)
+        try:
+            # Fixed-window budget is 30; 35 calls in one window should
+            # see exactly 30 allowed and 5 denied regardless of which
+            # "worker" ran them — that's the whole point of Redis.
+            async def fire():
+                allowed = denied = 0
+                for _ in range(35):
+                    ok = await api_main._check_rate_limit("1.2.3.4")
+                    allowed += int(ok)
+                    denied += int(not ok)
+                return allowed, denied
+            allowed, denied = asyncio.run(fire())
+            assert allowed == 30
+            assert denied == 5
+        finally:
+            api_main._redis_client = None
