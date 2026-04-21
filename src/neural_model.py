@@ -230,8 +230,20 @@ class LSTMModel(nn.Module if HAS_TORCH else object):
 def train_lstm(
     model: Any, tokens: List[int], vocab_size: int, epochs: int = 5,
     seq_len: int = 20, batch_size: int = 32, lr: float = 1e-3,
+    grad_clip: float = 1.0,
 ) -> Dict[str, List[float]]:
-    """Train LSTM language model."""
+    """Train the LSTM language model on a flat token stream.
+
+    The token stream is reshaped into ``batch_size`` parallel sequences
+    (classic PyTorch language-modelling layout). Each step consumes a
+    ``(batch_size, seq_len)`` window — in contrast to the previous
+    implementation which always ran at batch=1 because of a stray
+    ``unsqueeze(0)`` that ignored the ``batch_size`` argument entirely.
+
+    Training hygiene: gradient clipping keeps the LSTM stable over
+    multi-epoch runs; a cosine LR schedule decays the Adam learning rate
+    from ``lr`` to zero across ``epochs``.
+    """
     if not HAS_TORCH or not isinstance(model, nn.Module):
         logger.info("Mock training")
         return {"loss": [2.5 - 0.3*i for i in range(epochs)],
@@ -240,28 +252,52 @@ def train_lstm(
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = model.to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(epochs, 1))
     criterion = nn.CrossEntropyLoss()
-    history = {"loss": [], "perplexity": []}
-    model.train()
+    history: Dict[str, List[float]] = {"loss": [], "perplexity": [], "lr": []}
 
+    # Reshape the flat stream into `batch_size` parallel rows. Rows that
+    # don't fit cleanly into `n_steps` tokens are dropped — typical LM
+    # tutorial layout.
+    n_steps = len(tokens) // max(batch_size, 1)
+    if n_steps <= seq_len:
+        # Too-short corpus falls back to batch=1 — keeps tiny-corpus tests
+        # (13 tokens, seq_len=4) functional without a special case in callers.
+        data = torch.tensor(tokens, dtype=torch.long, device=device).unsqueeze(0)
+        effective_batch = 1
+    else:
+        truncated = tokens[: n_steps * batch_size]
+        data = torch.tensor(truncated, dtype=torch.long, device=device)
+        data = data.view(batch_size, n_steps)
+        effective_batch = batch_size
+
+    model.train()
     for epoch in range(epochs):
-        total_loss = 0.0; n_batch = 0
-        # Simple sequential batching
-        for i in range(0, len(tokens) - seq_len - 1, seq_len):
-            x = torch.tensor(tokens[i:i+seq_len], dtype=torch.long).unsqueeze(0).to(device)
-            y = torch.tensor(tokens[i+1:i+seq_len+1], dtype=torch.long).unsqueeze(0).to(device)
+        total_loss = 0.0
+        n_batch = 0
+        for i in range(0, data.size(1) - seq_len - 1, seq_len):
+            x = data[:, i:i+seq_len]
+            y = data[:, i+1:i+seq_len+1]
             optimizer.zero_grad()
             logits = model(x)
-            loss = criterion(logits.view(-1, vocab_size), y.view(-1))
+            loss = criterion(logits.reshape(-1, vocab_size), y.reshape(-1))
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
             optimizer.step()
-            total_loss += loss.item(); n_batch += 1
+            total_loss += loss.item()
+            n_batch += 1
 
+        scheduler.step()
         avg = total_loss / max(n_batch, 1)
         ppl = np.exp(min(avg, 20))
+        current_lr = optimizer.param_groups[0]["lr"]
         history["loss"].append(round(avg, 4))
         history["perplexity"].append(round(float(ppl), 4))
-        logger.info("LSTM Epoch %d/%d: loss=%.4f ppl=%.1f", epoch+1, epochs, avg, ppl)
+        history["lr"].append(round(current_lr, 6))
+        logger.info(
+            "LSTM Epoch %d/%d: loss=%.4f ppl=%.1f lr=%.2e batch=%d",
+            epoch + 1, epochs, avg, ppl, current_lr, effective_batch,
+        )
 
     return history
 
