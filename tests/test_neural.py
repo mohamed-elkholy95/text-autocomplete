@@ -138,3 +138,22 @@ class TestLSTMPersistence:
         )
         with pytest.raises(ValueError, match="model_type"):
             LSTMModel.load(str(path))
+
+    def test_load_rejects_schema_v1(self, tmp_path):
+        """v1 checkpoints (pre-weight-tying) must be refused, not silently loaded."""
+        import json
+        path = tmp_path / "oldbundle"
+        (tmp_path / "oldbundle.json").write_text(
+            json.dumps({
+                "model_type": "lstm",
+                "schema_version": 1,
+                "vocab": ["a", "b"],
+                "embed_dim": 8,
+                "hidden_dim": 16,
+                "num_layers": 1,
+                "dropout": 0.0,
+            }),
+            encoding="utf-8",
+        )
+        with pytest.raises(ValueError, match="schema_version=1"):
+            LSTMModel.load(str(path))

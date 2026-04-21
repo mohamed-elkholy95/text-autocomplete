@@ -55,6 +55,16 @@ class LSTMModel(nn.Module if HAS_TORCH else object):
         self._is_fitted = False
 
     def _build_layers(self, vocab_size: int) -> None:
+        """Build layers: embedding → LSTM → hidden-to-embed projection → tied logits.
+
+        The output projection's weight is tied to the input embedding
+        (Press & Wolf 2016), which halves the final-layer parameter count
+        and typically improves perplexity. Weight tying requires the tied
+        matrices to share their inner dimension, so when ``hidden_dim !=
+        embed_dim`` we insert a small ``nn.Linear(hidden_dim, embed_dim)``
+        projection (path (b) of the AWD-LSTM recipe). This keeps the
+        public ``embed_dim`` / ``hidden_dim`` defaults free to diverge.
+        """
         if not HAS_TORCH:
             return
         self.embedding = nn.Embedding(vocab_size, self._embed_dim)
@@ -65,14 +75,18 @@ class LSTMModel(nn.Module if HAS_TORCH else object):
             batch_first=True,
             dropout=self._dropout if self._num_layers > 1 else 0.0,
         )
-        self.fc = nn.Linear(self._hidden_dim, vocab_size)
+        self.proj = nn.Linear(self._hidden_dim, self._embed_dim)
+        # Tied-weight output layer: bias=False because we can't tie the bias,
+        # and in practice the bias contributes little once weights are tied.
+        self.fc = nn.Linear(self._embed_dim, vocab_size, bias=False)
+        self.fc.weight = self.embedding.weight
 
     def forward(self, x: Any) -> Any:
         if not HAS_TORCH:
             return None
         emb = self.embedding(x)
         lstm_out, _ = self.lstm(emb)
-        return self.fc(lstm_out)
+        return self.fc(self.proj(lstm_out))
 
     # ------------------------------------------------------------------
     # Shared contract: fit(tokens) / predict_next(context, top_k)
@@ -171,7 +185,7 @@ class LSTMModel(nn.Module if HAS_TORCH else object):
 
         meta = {
             "model_type": "lstm",
-            "schema_version": 1,
+            "schema_version": 2,
             "vocab": [self._id_to_word[i] for i in range(len(self._id_to_word))],
             "embed_dim": self._embed_dim,
             "hidden_dim": self._hidden_dim,
@@ -208,6 +222,15 @@ class LSTMModel(nn.Module if HAS_TORCH else object):
             meta = json.load(f)
         if meta.get("model_type") != "lstm":
             raise ValueError(f"Expected model_type 'lstm', got '{meta.get('model_type')}'")
+
+        schema = meta.get("schema_version", 1)
+        if schema != 2:
+            raise ValueError(
+                f"Unsupported LSTM checkpoint schema_version={schema}. "
+                "Schema 2 added weight tying + a hidden→embed projection "
+                "(Press-Wolf 2016); older checkpoints have no tied layer "
+                "and can't be converted losslessly. Retrain and resave."
+            )
 
         model = cls(
             vocab_size=len(meta["vocab"]),
