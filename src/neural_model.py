@@ -8,9 +8,12 @@ behaviour to keep the rest of the test suite green.
 """
 
 import logging
-from typing import Any, Dict, List, Tuple
+from collections import Counter
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
+
+UNK_TOKEN = "<unk>"
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +41,7 @@ class LSTMModel(nn.Module if HAS_TORCH else object):
         hidden_dim: int = 128,
         num_layers: int = 2,
         dropout: float = 0.2,
+        vocab_cap: Optional[int] = None,
     ) -> None:
         if HAS_TORCH:
             super().__init__()
@@ -53,8 +57,21 @@ class LSTMModel(nn.Module if HAS_TORCH else object):
         self._word_to_id: Dict[str, int] = {}
         self._id_to_word: Dict[int, str] = {}
         self._is_fitted = False
+        # Cap the vocabulary to the top-N most frequent tokens during fit.
+        # Rare tokens map to <unk>. None = no cap (legacy behaviour).
+        self._vocab_cap = vocab_cap
 
     def _build_layers(self, vocab_size: int) -> None:
+        """Build layers: embedding → LSTM → hidden-to-embed projection → tied logits.
+
+        The output projection's weight is tied to the input embedding
+        (Press & Wolf 2016), which halves the final-layer parameter count
+        and typically improves perplexity. Weight tying requires the tied
+        matrices to share their inner dimension, so when ``hidden_dim !=
+        embed_dim`` we insert a small ``nn.Linear(hidden_dim, embed_dim)``
+        projection (path (b) of the AWD-LSTM recipe). This keeps the
+        public ``embed_dim`` / ``hidden_dim`` defaults free to diverge.
+        """
         if not HAS_TORCH:
             return
         self.embedding = nn.Embedding(vocab_size, self._embed_dim)
@@ -65,14 +82,18 @@ class LSTMModel(nn.Module if HAS_TORCH else object):
             batch_first=True,
             dropout=self._dropout if self._num_layers > 1 else 0.0,
         )
-        self.fc = nn.Linear(self._hidden_dim, vocab_size)
+        self.proj = nn.Linear(self._hidden_dim, self._embed_dim)
+        # Tied-weight output layer: bias=False because we can't tie the bias,
+        # and in practice the bias contributes little once weights are tied.
+        self.fc = nn.Linear(self._embed_dim, vocab_size, bias=False)
+        self.fc.weight = self.embedding.weight
 
     def forward(self, x: Any) -> Any:
         if not HAS_TORCH:
             return None
         emb = self.embedding(x)
         lstm_out, _ = self.lstm(emb)
-        return self.fc(lstm_out)
+        return self.fc(self.proj(lstm_out))
 
     # ------------------------------------------------------------------
     # Shared contract: fit(tokens) / predict_next(context, top_k)
@@ -86,14 +107,31 @@ class LSTMModel(nn.Module if HAS_TORCH else object):
         lr: float = 1e-3,
     ) -> "LSTMModel":
         """Fit the model on a token list. Trains when torch is present,
-        otherwise just builds the vocabulary so predict_next stays usable."""
-        vocab = sorted(set(tokens))
+        otherwise just builds the vocabulary so predict_next stays usable.
+
+        Vocabulary construction: ``<unk>`` is always ID 0. When
+        ``vocab_cap`` is set, the top-(cap-1) most frequent tokens are
+        kept and everything else collapses to ``<unk>`` — this prevents
+        the long-tail softmax from dominating diversity / coverage
+        metrics on large corpora. With no cap, every observed token gets
+        its own id plus the ``<unk>`` slot (unused during training but
+        available at predict time for OOV context words).
+        """
+        counts = Counter(tokens)
+        if self._vocab_cap is not None and self._vocab_cap > 0:
+            kept = [w for w, _ in counts.most_common(self._vocab_cap - 1)]
+        else:
+            kept = sorted(counts.keys())
+
+        # <unk> occupies ID 0. Training tokens that aren't in `kept` map to it.
+        vocab = [UNK_TOKEN] + [w for w in kept if w != UNK_TOKEN]
         self._word_to_id = {w: i for i, w in enumerate(vocab)}
         self._id_to_word = {i: w for w, i in self._word_to_id.items()}
+        unk_id = self._word_to_id[UNK_TOKEN]
 
         if HAS_TORCH:
             self._build_layers(len(vocab))
-            token_ids = [self._word_to_id[w] for w in tokens]
+            token_ids = [self._word_to_id.get(w, unk_id) for w in tokens]
             train_lstm(
                 self,
                 token_ids,
@@ -113,11 +151,15 @@ class LSTMModel(nn.Module if HAS_TORCH else object):
     ) -> List[Tuple[str, float]]:
         """Return top-k (word, probability) predictions for the context."""
         if not self._is_fitted:
-            return [("<UNK>", 0.0)]
+            return [(UNK_TOKEN, 0.0)]
 
-        token_ids = [self._word_to_id[w] for w in context if w in self._word_to_id]
+        # OOV context tokens map to <unk> instead of being silently dropped —
+        # so the model actually sees every position, and a context of all-OOV
+        # words still produces a prediction instead of a hard-coded (<UNK>, 0).
+        unk_id = self._word_to_id.get(UNK_TOKEN, 0)
+        token_ids = [self._word_to_id.get(w, unk_id) for w in context]
         if not token_ids or not HAS_TORCH:
-            return [("<UNK>", 0.0)]
+            return [(UNK_TOKEN, 0.0)]
 
         raw = predict_next_lstm(self, token_ids, top_k=top_k)
         # raw is List[Tuple[str(id), prob)] -> map ids back to words.
@@ -171,12 +213,13 @@ class LSTMModel(nn.Module if HAS_TORCH else object):
 
         meta = {
             "model_type": "lstm",
-            "schema_version": 1,
+            "schema_version": 2,
             "vocab": [self._id_to_word[i] for i in range(len(self._id_to_word))],
             "embed_dim": self._embed_dim,
             "hidden_dim": self._hidden_dim,
             "num_layers": self._num_layers,
             "dropout": self._dropout,
+            "vocab_cap": self._vocab_cap,
         }
         with open(meta_path, "w", encoding="utf-8") as f:
             json.dump(meta, f, ensure_ascii=False, indent=2)
@@ -209,12 +252,22 @@ class LSTMModel(nn.Module if HAS_TORCH else object):
         if meta.get("model_type") != "lstm":
             raise ValueError(f"Expected model_type 'lstm', got '{meta.get('model_type')}'")
 
+        schema = meta.get("schema_version", 1)
+        if schema != 2:
+            raise ValueError(
+                f"Unsupported LSTM checkpoint schema_version={schema}. "
+                "Schema 2 added weight tying + a hidden→embed projection "
+                "(Press-Wolf 2016); older checkpoints have no tied layer "
+                "and can't be converted losslessly. Retrain and resave."
+            )
+
         model = cls(
             vocab_size=len(meta["vocab"]),
             embed_dim=meta["embed_dim"],
             hidden_dim=meta["hidden_dim"],
             num_layers=meta["num_layers"],
             dropout=meta["dropout"],
+            vocab_cap=meta.get("vocab_cap"),
         )
         model._word_to_id = {w: i for i, w in enumerate(meta["vocab"])}
         model._id_to_word = {i: w for w, i in model._word_to_id.items()}
@@ -230,7 +283,7 @@ class LSTMModel(nn.Module if HAS_TORCH else object):
 def train_lstm(
     model: Any, tokens: List[int], vocab_size: int, epochs: int = 5,
     seq_len: int = 20, batch_size: int = 32, lr: float = 1e-3,
-    grad_clip: float = 1.0,
+    grad_clip: float = 1.0, use_amp: bool = True,
 ) -> Dict[str, List[float]]:
     """Train the LSTM language model on a flat token stream.
 
@@ -243,6 +296,11 @@ def train_lstm(
     Training hygiene: gradient clipping keeps the LSTM stable over
     multi-epoch runs; a cosine LR schedule decays the Adam learning rate
     from ``lr`` to zero across ``epochs``.
+
+    Mixed precision: when ``use_amp`` is True and the device is CUDA,
+    the forward + loss run under ``torch.autocast(dtype=bfloat16)``.
+    bfloat16 has fp32's exponent range, so no loss scaler is needed; the
+    tied-embedding checkpoint is still stored in fp32 on disk.
     """
     if not HAS_TORCH or not isinstance(model, nn.Module):
         logger.info("Mock training")
@@ -255,6 +313,7 @@ def train_lstm(
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(epochs, 1))
     criterion = nn.CrossEntropyLoss()
     history: Dict[str, List[float]] = {"loss": [], "perplexity": [], "lr": []}
+    amp_enabled = bool(use_amp and device.type == "cuda" and torch.cuda.is_bf16_supported())
 
     # Reshape the flat stream into `batch_size` parallel rows. Rows that
     # don't fit cleanly into `n_steps` tokens are dropped — typical LM
@@ -279,8 +338,9 @@ def train_lstm(
             x = data[:, i:i+seq_len]
             y = data[:, i+1:i+seq_len+1]
             optimizer.zero_grad()
-            logits = model(x)
-            loss = criterion(logits.reshape(-1, vocab_size), y.reshape(-1))
+            with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=amp_enabled):
+                logits = model(x)
+                loss = criterion(logits.reshape(-1, vocab_size), y.reshape(-1))
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
             optimizer.step()
@@ -295,8 +355,9 @@ def train_lstm(
         history["perplexity"].append(round(float(ppl), 4))
         history["lr"].append(round(current_lr, 6))
         logger.info(
-            "LSTM Epoch %d/%d: loss=%.4f ppl=%.1f lr=%.2e batch=%d",
+            "LSTM Epoch %d/%d: loss=%.4f ppl=%.1f lr=%.2e batch=%d amp=%s",
             epoch + 1, epochs, avg, ppl, current_lr, effective_batch,
+            "bf16" if amp_enabled else "off",
         )
 
     return history

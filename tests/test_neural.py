@@ -138,3 +138,45 @@ class TestLSTMPersistence:
         )
         with pytest.raises(ValueError, match="model_type"):
             LSTMModel.load(str(path))
+
+    def test_vocab_cap_collapses_rare_tokens_to_unk(self):
+        """With vocab_cap=N, the trained vocab has exactly N entries and
+        <unk> is the id for anything that didn't make the top-(N-1)."""
+        tokens = (
+            ["a"] * 10 + ["b"] * 8 + ["c"] * 6 + ["d"] * 4
+            + ["rare1", "rare2", "rare3"]
+        )
+        model = LSTMModel(embed_dim=8, hidden_dim=16, num_layers=1, vocab_cap=4)
+        model.fit(tokens, epochs=1, seq_len=3, batch_size=2)
+
+        assert model.vocab_size == 4  # <unk> + top-3 frequent
+        assert "<unk>" in model._word_to_id
+        for common in ("a", "b", "c"):
+            assert common in model._word_to_id
+        for rare in ("d", "rare1", "rare2", "rare3"):
+            assert rare not in model._word_to_id
+
+        # OOV context word now routes through <unk> rather than returning
+        # a hard-coded ("<UNK>", 0.0).
+        preds = model.predict_next(["definitely_not_in_vocab"], top_k=3)
+        assert len(preds) > 0
+        assert all(prob > 0.0 for _, prob in preds)
+
+    def test_load_rejects_schema_v1(self, tmp_path):
+        """v1 checkpoints (pre-weight-tying) must be refused, not silently loaded."""
+        import json
+        path = tmp_path / "oldbundle"
+        (tmp_path / "oldbundle.json").write_text(
+            json.dumps({
+                "model_type": "lstm",
+                "schema_version": 1,
+                "vocab": ["a", "b"],
+                "embed_dim": 8,
+                "hidden_dim": 16,
+                "num_layers": 1,
+                "dropout": 0.0,
+            }),
+            encoding="utf-8",
+        )
+        with pytest.raises(ValueError, match="schema_version=1"):
+            LSTMModel.load(str(path))
