@@ -8,9 +8,12 @@ behaviour to keep the rest of the test suite green.
 """
 
 import logging
-from typing import Any, Dict, List, Tuple
+from collections import Counter
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
+
+UNK_TOKEN = "<unk>"
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +41,7 @@ class LSTMModel(nn.Module if HAS_TORCH else object):
         hidden_dim: int = 128,
         num_layers: int = 2,
         dropout: float = 0.2,
+        vocab_cap: Optional[int] = None,
     ) -> None:
         if HAS_TORCH:
             super().__init__()
@@ -53,6 +57,9 @@ class LSTMModel(nn.Module if HAS_TORCH else object):
         self._word_to_id: Dict[str, int] = {}
         self._id_to_word: Dict[int, str] = {}
         self._is_fitted = False
+        # Cap the vocabulary to the top-N most frequent tokens during fit.
+        # Rare tokens map to <unk>. None = no cap (legacy behaviour).
+        self._vocab_cap = vocab_cap
 
     def _build_layers(self, vocab_size: int) -> None:
         """Build layers: embedding → LSTM → hidden-to-embed projection → tied logits.
@@ -100,14 +107,31 @@ class LSTMModel(nn.Module if HAS_TORCH else object):
         lr: float = 1e-3,
     ) -> "LSTMModel":
         """Fit the model on a token list. Trains when torch is present,
-        otherwise just builds the vocabulary so predict_next stays usable."""
-        vocab = sorted(set(tokens))
+        otherwise just builds the vocabulary so predict_next stays usable.
+
+        Vocabulary construction: ``<unk>`` is always ID 0. When
+        ``vocab_cap`` is set, the top-(cap-1) most frequent tokens are
+        kept and everything else collapses to ``<unk>`` — this prevents
+        the long-tail softmax from dominating diversity / coverage
+        metrics on large corpora. With no cap, every observed token gets
+        its own id plus the ``<unk>`` slot (unused during training but
+        available at predict time for OOV context words).
+        """
+        counts = Counter(tokens)
+        if self._vocab_cap is not None and self._vocab_cap > 0:
+            kept = [w for w, _ in counts.most_common(self._vocab_cap - 1)]
+        else:
+            kept = sorted(counts.keys())
+
+        # <unk> occupies ID 0. Training tokens that aren't in `kept` map to it.
+        vocab = [UNK_TOKEN] + [w for w in kept if w != UNK_TOKEN]
         self._word_to_id = {w: i for i, w in enumerate(vocab)}
         self._id_to_word = {i: w for w, i in self._word_to_id.items()}
+        unk_id = self._word_to_id[UNK_TOKEN]
 
         if HAS_TORCH:
             self._build_layers(len(vocab))
-            token_ids = [self._word_to_id[w] for w in tokens]
+            token_ids = [self._word_to_id.get(w, unk_id) for w in tokens]
             train_lstm(
                 self,
                 token_ids,
@@ -127,11 +151,15 @@ class LSTMModel(nn.Module if HAS_TORCH else object):
     ) -> List[Tuple[str, float]]:
         """Return top-k (word, probability) predictions for the context."""
         if not self._is_fitted:
-            return [("<UNK>", 0.0)]
+            return [(UNK_TOKEN, 0.0)]
 
-        token_ids = [self._word_to_id[w] for w in context if w in self._word_to_id]
+        # OOV context tokens map to <unk> instead of being silently dropped —
+        # so the model actually sees every position, and a context of all-OOV
+        # words still produces a prediction instead of a hard-coded (<UNK>, 0).
+        unk_id = self._word_to_id.get(UNK_TOKEN, 0)
+        token_ids = [self._word_to_id.get(w, unk_id) for w in context]
         if not token_ids or not HAS_TORCH:
-            return [("<UNK>", 0.0)]
+            return [(UNK_TOKEN, 0.0)]
 
         raw = predict_next_lstm(self, token_ids, top_k=top_k)
         # raw is List[Tuple[str(id), prob)] -> map ids back to words.
@@ -191,6 +219,7 @@ class LSTMModel(nn.Module if HAS_TORCH else object):
             "hidden_dim": self._hidden_dim,
             "num_layers": self._num_layers,
             "dropout": self._dropout,
+            "vocab_cap": self._vocab_cap,
         }
         with open(meta_path, "w", encoding="utf-8") as f:
             json.dump(meta, f, ensure_ascii=False, indent=2)
@@ -238,6 +267,7 @@ class LSTMModel(nn.Module if HAS_TORCH else object):
             hidden_dim=meta["hidden_dim"],
             num_layers=meta["num_layers"],
             dropout=meta["dropout"],
+            vocab_cap=meta.get("vocab_cap"),
         )
         model._word_to_id = {w: i for i, w in enumerate(meta["vocab"])}
         model._id_to_word = {i: w for w, i in model._word_to_id.items()}
