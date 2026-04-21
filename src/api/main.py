@@ -36,7 +36,7 @@ from typing import Annotated, Dict, List, Optional
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field, StringConstraints
+from pydantic import BaseModel, Field, StringConstraints, model_validator
 
 from src.config import API_TITLE, API_VERSION, TOP_K
 
@@ -54,7 +54,8 @@ app = FastAPI(
     Supports multiple language models:
     - **ngram**: Classic n-gram model with backoff smoothing (fast, interpretable)
     - **markov**: Markov chain model (simple transition probabilities)
-    - **beam**: N-gram model with beam search decoding (higher quality, slower)
+    - **lstm**: 2-layer LSTM with tied weights (requires PyTorch)
+    - **transformer**: Decoder-only transformer with causal self-attention (requires PyTorch)
 
     ## How Autocomplete Works
     1. Send your text as input
@@ -282,13 +283,69 @@ def _transformer_available() -> bool:
         return False
 
 
-def _get_trained_transformer():
+def _lstm_available() -> bool:
+    """Return True when the LSTM path can train/serve.
+
+    Same optional-torch anchor as the transformer: the LSTM entry only
+    shows up in /models and is only selectable in /autocomplete when
+    PyTorch is importable. No-torch installs see ngram + markov only.
+    """
+    try:
+        from src.neural_model import HAS_TORCH
+        return bool(HAS_TORCH)
+    except Exception:
+        return False
+
+
+def _bpe_available() -> bool:
+    """Return True when the BPE subword path can train/serve.
+
+    BPE needs torch (for the neural models it feeds) AND the optional
+    'transformers' package (for the HF tokenizer). The selector stays
+    a no-op on minimal installs — tokenizer='bpe' returns 503 there.
+    """
+    if not _lstm_available():
+        return False
+    try:
+        from src.bpe_tokenizer import HAS_TRANSFORMERS
+        return bool(HAS_TRANSFORMERS)
+    except Exception:
+        return False
+
+
+def _maybe_build_bpe_tokenizer(tokenizer_flavour: str):
+    """Return a BPETokenizer instance or None.
+
+    Raises 503 when the caller asked for BPE but 'transformers' isn't
+    installed, so the error surfaces at the API boundary instead of
+    reaching the model layer as a generic ImportError."""
+    if tokenizer_flavour != "bpe":
+        return None
+    if not _bpe_available():
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "BPE tokenizer unavailable: install the optional "
+                "'transformers' package to enable subword mode."
+            ),
+        )
+    from src.bpe_tokenizer import BPETokenizer
+    return BPETokenizer()
+
+
+def _get_trained_transformer(tokenizer_flavour: str = "word"):
     """Get or create a cached trained decoder-only transformer.
 
     Uses a deliberately small config (d_model=64, 2 layers, 3 epochs)
     so the first request finishes in a few seconds on CPU. This mirrors
-    the CLI eval's --include-transformer defaults."""
-    if "transformer" not in _model_cache:
+    the CLI eval's --include-transformer defaults.
+
+    ``tokenizer_flavour`` picks the vocabulary: ``"word"`` (default)
+    uses the project's whitespace+regex tokenizer; ``"bpe"`` wires in
+    a ``BPETokenizer`` so the model trains on subword ids. BPE and
+    word-level instances are cached independently."""
+    cache_key = f"transformer:{tokenizer_flavour}"
+    if cache_key not in _model_cache:
         if not _transformer_available():
             raise HTTPException(
                 status_code=503,
@@ -296,18 +353,61 @@ def _get_trained_transformer():
             )
         from src.data_loader import tokenize, load_sample_data
         from src.transformer_model import TransformerModel
-        tokens = tokenize(load_sample_data())
+        bpe = _maybe_build_bpe_tokenizer(tokenizer_flavour)
+        # Raw text for BPE (tokenizer encodes internally); pre-tokenized
+        # list for the word-level path.
+        raw_text = load_sample_data()
+        data = raw_text if bpe is not None else tokenize(raw_text)
+        length = len(data) if isinstance(data, list) else len(data.split())
         model = TransformerModel(
             d_model=64, n_heads=4, n_layers=2, ff_dim=128, max_seq_len=64,
         )
         model.fit(
-            tokens, epochs=3,
-            seq_len=min(16, max(len(tokens) // 4, 4)),
+            data, epochs=3,
+            seq_len=min(16, max(length // 4, 4)),
             batch_size=16, lr=3e-4,
+            tokenizer=bpe,
         )
-        _model_cache["transformer"] = model
-        logger.info("Transformer model trained and cached")
-    return _model_cache["transformer"]
+        _model_cache[cache_key] = model
+        logger.info("Transformer model (%s) trained and cached", tokenizer_flavour)
+    return _model_cache[cache_key]
+
+
+def _get_trained_lstm(tokenizer_flavour: str = "word"):
+    """Get or create a cached trained LSTM.
+
+    Tiny config (embed=32, hidden=64, 1 layer, 3 epochs) so the first
+    request finishes in a second or two on CPU. Mirrors the transformer
+    helper's lazy-fit-on-sample-corpus pattern; production deployments
+    would load a pre-trained checkpoint via LSTMModel.load() instead.
+
+    ``tokenizer_flavour`` picks the vocabulary the same way as the
+    transformer helper."""
+    cache_key = f"lstm:{tokenizer_flavour}"
+    if cache_key not in _model_cache:
+        if not _lstm_available():
+            raise HTTPException(
+                status_code=503,
+                detail="LSTM model unavailable: PyTorch is not installed.",
+            )
+        from src.data_loader import tokenize, load_sample_data
+        from src.neural_model import LSTMModel
+        bpe = _maybe_build_bpe_tokenizer(tokenizer_flavour)
+        raw_text = load_sample_data()
+        data = raw_text if bpe is not None else tokenize(raw_text)
+        length = len(data) if isinstance(data, list) else len(data.split())
+        model = LSTMModel(
+            embed_dim=32, hidden_dim=64, num_layers=1, dropout=0.0,
+        )
+        model.fit(
+            data, epochs=3,
+            seq_len=min(16, max(length // 4, 4)),
+            batch_size=16, lr=1e-3,
+            tokenizer=bpe,
+        )
+        _model_cache[cache_key] = model
+        logger.info("LSTM model (%s) trained and cached", tokenizer_flavour)
+    return _model_cache[cache_key]
 
 
 # ---------------------------------------------------------------------------
@@ -339,13 +439,31 @@ class AutocompleteRequest(BaseModel):
     )
     model: str = Field(
         default="ngram",
-        pattern="^(ngram|markov|transformer)$",
+        pattern="^(ngram|markov|lstm|transformer)$",
         description=(
             "Language model to use: 'ngram', 'markov', or (when PyTorch "
-            "is installed) 'transformer'. Selecting 'transformer' on a "
-            "minimal install returns 503."
+            "is installed) 'lstm' / 'transformer'. Selecting a neural "
+            "model on a minimal install returns 503."
         ),
     )
+    tokenizer: str = Field(
+        default="word",
+        pattern="^(word|bpe)$",
+        description=(
+            "Tokenizer flavour: 'word' (default) uses the project's "
+            "whitespace+regex tokenizer; 'bpe' wires in a byte-level "
+            "BPE tokenizer (needs the optional 'transformers' package, "
+            "and only valid with model='lstm' or 'transformer')."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _tokenizer_requires_neural_model(self) -> "AutocompleteRequest":
+        if self.tokenizer == "bpe" and self.model not in ("lstm", "transformer"):
+            raise ValueError(
+                "tokenizer='bpe' only applies to model='lstm' or 'transformer'"
+            )
+        return self
 
 
 class Suggestion(BaseModel):
@@ -375,7 +493,19 @@ class BatchRequest(BaseModel):
         ),
     )
     top_k: int = Field(default=5, ge=1, le=20)
-    model: str = Field(default="ngram", pattern="^(ngram|markov)$")
+    model: str = Field(
+        default="ngram",
+        pattern="^(ngram|markov|lstm|transformer)$",
+    )
+    tokenizer: str = Field(default="word", pattern="^(word|bpe)$")
+
+    @model_validator(mode="after")
+    def _tokenizer_requires_neural_model(self) -> "BatchRequest":
+        if self.tokenizer == "bpe" and self.model not in ("lstm", "transformer"):
+            raise ValueError(
+                "tokenizer='bpe' only applies to model='lstm' or 'transformer'"
+            )
+        return self
 
 
 class BatchResponse(BaseModel):
@@ -428,8 +558,10 @@ async def autocomplete(req: AutocompleteRequest):
     # Select the model
     if req.model == "markov":
         model = _get_trained_markov()
+    elif req.model == "lstm":
+        model = _get_trained_lstm(tokenizer_flavour=req.tokenizer)
     elif req.model == "transformer":
-        model = _get_trained_transformer()
+        model = _get_trained_transformer(tokenizer_flavour=req.tokenizer)
     else:
         model = _get_trained_ngram()
 
@@ -516,6 +648,16 @@ async def list_models():
             "description": "First-order Markov chain with Laplace smoothing. Simple and effective for common word pairs.",
         },
     ]
+    if _lstm_available():
+        catalogue.append({
+            "id": "lstm",
+            "name": "LSTM Language Model",
+            "description": (
+                "2-layer LSTM with tied embedding/output weights. Trained "
+                "lazily on first request with a tiny config (embed=32, "
+                "hidden=64); production would load a pre-trained checkpoint."
+            ),
+        })
     if _transformer_available():
         catalogue.append({
             "id": "transformer",
@@ -629,11 +771,16 @@ async def vocab_stats():
     tokens = tokenize(load_sample_data())
     stats = get_corpus_stats(tokens)
 
+    available = ["ngram", "markov"]
+    if _lstm_available():
+        available.append("lstm")
+    if _transformer_available():
+        available.append("transformer")
     return {
         "corpus": stats,
         "ngram_vocab_size": _get_trained_ngram().vocab_size,
         "markov_vocab_size": _get_trained_markov().vocab_size,
-        "available_models": ["ngram", "markov"],
+        "available_models": available,
     }
 
 

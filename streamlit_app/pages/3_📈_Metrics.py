@@ -3,7 +3,9 @@ Metrics Page — Model Evaluation and Analysis
 ==============================================
 """
 
+import subprocess
 import sys
+import time
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
@@ -12,6 +14,9 @@ import plotly.graph_objects as go
 import plotly.express as px
 import numpy as np
 from collections import Counter
+
+REPO_ROOT = Path(__file__).resolve().parent.parent.parent
+PYTHON_BIN = sys.executable
 
 from src.data_loader import tokenize, load_sample_data, train_test_split, get_corpus_stats
 from src.ngram_model import NGramModel
@@ -297,3 +302,158 @@ if st.button("🔗 Show Transitions", use_container_width=True):
             "{word_input}" appeared {sum(p * 100 for p in probs):.0f}% of the time
             with these {len(transitions)} words as its successor.
             """)
+
+
+# ---------------------------------------------------------------------------
+# Dynamic Benchmarks (subprocess drivers)
+# ---------------------------------------------------------------------------
+# Streamlit can't stream multi-minute GPU benchmarks responsively, so these
+# buttons shell out to the scripts under scripts/ with a hard timeout and
+# cache the last-captured stdout in session_state. A subsequent page rerun
+# renders the cached result instantly instead of re-training.
+st.divider()
+st.header("🧪 Dynamic Benchmarks")
+
+st.markdown(
+    """
+Run the project's larger benchmark scripts directly from the UI. Each
+run shells out to its script with a hard timeout, captures stdout, and
+caches the result in this browser session. Click the same button again
+to re-run; the cache persists across page reruns within the session.
+
+**These scripts need extra setup** — see [CLAUDE.local.md](../../CLAUDE.local.md)
+for the conda env and GPU pre-reqs. Without PyTorch / transformers
+installed they'll exit non-zero and print the missing dependency.
+"""
+)
+
+BENCHMARKS = [
+    {
+        "key": "bench_real_data",
+        "label": "WikiText-2 (n-gram / Markov / LSTM / Transformer)",
+        "script": "scripts/bench_real_data.py",
+        "timeout_s": 15 * 60,
+        "caption": (
+            "Trains all four model families on the full WikiText-2 train "
+            "split and reports PPL / top-k / diversity / coverage on the "
+            "held-out 10%. Uses GPU when available."
+        ),
+    },
+    {
+        "key": "bench_bpe",
+        "label": "BPE subword (LSTM + Transformer)",
+        "script": "scripts/bench_bpe.py",
+        "timeout_s": 30 * 60,
+        "caption": (
+            "Trains both neural families on SmolLM2-tokenized WikiText-2. "
+            "PPL is in subword units — not directly comparable to the "
+            "word-level rows above."
+        ),
+    },
+]
+
+# Initialise the session cache once per browser session.
+if "benchmark_runs" not in st.session_state:
+    st.session_state["benchmark_runs"] = {}
+
+
+def _run_benchmark(script_rel_path: str, timeout_s: int):
+    """Run a benchmark script with a hard timeout. Returns a dict the UI
+    can render regardless of success/failure."""
+    script_path = REPO_ROOT / script_rel_path
+    if not script_path.exists():
+        return {
+            "ok": False,
+            "returncode": -1,
+            "stdout": "",
+            "stderr": f"Script not found: {script_path}",
+            "duration_s": 0.0,
+            "finished_at": time.time(),
+            "timed_out": False,
+        }
+    start = time.perf_counter()
+    try:
+        proc = subprocess.run(
+            [PYTHON_BIN, str(script_path)],
+            cwd=str(REPO_ROOT),
+            capture_output=True,
+            text=True,
+            timeout=timeout_s,
+        )
+        return {
+            "ok": proc.returncode == 0,
+            "returncode": proc.returncode,
+            "stdout": proc.stdout,
+            "stderr": proc.stderr,
+            "duration_s": time.perf_counter() - start,
+            "finished_at": time.time(),
+            "timed_out": False,
+        }
+    except subprocess.TimeoutExpired as exc:
+        return {
+            "ok": False,
+            "returncode": -1,
+            "stdout": exc.stdout.decode() if isinstance(exc.stdout, bytes) else (exc.stdout or ""),
+            "stderr": (
+                (exc.stderr.decode() if isinstance(exc.stderr, bytes) else (exc.stderr or ""))
+                + f"\n\n[timeout] killed after {timeout_s}s"
+            ),
+            "duration_s": time.perf_counter() - start,
+            "finished_at": time.time(),
+            "timed_out": True,
+        }
+
+
+def _render_benchmark_result(result: dict) -> None:
+    """Render a captured benchmark run."""
+    age_s = time.time() - result["finished_at"]
+    if result["ok"]:
+        st.success(
+            f"✅ Finished in {result['duration_s']:.1f}s "
+            f"({age_s:.0f}s ago)."
+        )
+    elif result["timed_out"]:
+        st.error(
+            f"⏱ Timed out after {result['duration_s']:.1f}s. "
+            f"The script is still killable from the shell; re-run "
+            f"externally if you need a longer budget."
+        )
+    else:
+        st.error(
+            f"❌ Exit code {result['returncode']} after "
+            f"{result['duration_s']:.1f}s ({age_s:.0f}s ago)."
+        )
+    if result["stdout"]:
+        with st.expander("stdout", expanded=result["ok"]):
+            st.code(result["stdout"], language="text")
+    if result["stderr"]:
+        with st.expander("stderr", expanded=not result["ok"]):
+            st.code(result["stderr"], language="text")
+
+
+for bench in BENCHMARKS:
+    st.subheader(bench["label"])
+    st.caption(bench["caption"])
+    col1, col2 = st.columns([1, 2])
+    with col1:
+        clicked = st.button(
+            f"▶ Run (timeout {bench['timeout_s'] // 60} min)",
+            key=f"run_{bench['key']}",
+            use_container_width=True,
+        )
+    with col2:
+        cached = st.session_state["benchmark_runs"].get(bench["key"])
+        if cached is not None:
+            age_s = time.time() - cached["finished_at"]
+            st.caption(f"Last run: {age_s:.0f}s ago in this session.")
+        else:
+            st.caption("No run cached yet in this session.")
+    if clicked:
+        with st.spinner(
+            f"Running {bench['script']} (up to {bench['timeout_s'] // 60} min)…"
+        ):
+            result = _run_benchmark(bench["script"], bench["timeout_s"])
+        st.session_state["benchmark_runs"][bench["key"]] = result
+        _render_benchmark_result(result)
+    elif cached is not None:
+        _render_benchmark_result(cached)

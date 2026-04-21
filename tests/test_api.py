@@ -197,6 +197,17 @@ class TestListModels:
         else:
             assert "transformer" not in model_ids
 
+    def test_list_models_lstm_presence_tracks_torch(self):
+        """Same optional-torch anchor for the LSTM entry."""
+        from src.neural_model import HAS_TORCH
+        resp = client.get("/models")
+        data = resp.json()
+        model_ids = [m["id"] for m in data["models"]]
+        if HAS_TORCH:
+            assert "lstm" in model_ids
+        else:
+            assert "lstm" not in model_ids
+
 
 class TestTransformerEndpoint:
     """Tests for the transformer path in /autocomplete."""
@@ -208,7 +219,9 @@ class TestTransformerEndpoint:
         from src.api import main as api_main
         monkeypatch.setattr(api_main, "_transformer_available", lambda: False)
         # Also evict any cached transformer so the helper has to check.
-        api_main._model_cache.pop("transformer", None)
+        for k in list(api_main._model_cache):
+            if k.startswith("transformer"):
+                api_main._model_cache.pop(k, None)
         resp = client.post("/autocomplete", json={
             "text": "machine learning is",
             "top_k": 3,
@@ -216,6 +229,94 @@ class TestTransformerEndpoint:
         })
         assert resp.status_code == 503
         assert "PyTorch" in resp.json().get("detail", "")
+
+
+class TestLSTMEndpoint:
+    """Tests for the LSTM path in /autocomplete."""
+
+    def test_lstm_returns_503_without_torch(self, monkeypatch):
+        """Selecting 'lstm' on a no-torch install must fail with a clear
+        503 — same optional-torch anchor the transformer enforces."""
+        from src.api import main as api_main
+        monkeypatch.setattr(api_main, "_lstm_available", lambda: False)
+        for k in list(api_main._model_cache):
+            if k.startswith("lstm"):
+                api_main._model_cache.pop(k, None)
+        resp = client.post("/autocomplete", json={
+            "text": "machine learning is",
+            "top_k": 3,
+            "model": "lstm",
+        })
+        assert resp.status_code == 503
+        assert "PyTorch" in resp.json().get("detail", "")
+
+
+class TestTokenizerSelector:
+    """Tests for the BPE tokenizer flag in /autocomplete and batch."""
+
+    def test_bpe_with_ngram_rejected(self):
+        """BPE only makes sense for neural models — ngram+bpe must 422."""
+        resp = client.post("/autocomplete", json={
+            "text": "machine learning",
+            "model": "ngram",
+            "tokenizer": "bpe",
+        })
+        assert resp.status_code == 422
+
+    def test_bpe_with_markov_rejected(self):
+        resp = client.post("/autocomplete", json={
+            "text": "machine learning",
+            "model": "markov",
+            "tokenizer": "bpe",
+        })
+        assert resp.status_code == 422
+
+    def test_bpe_batch_with_ngram_rejected(self):
+        resp = client.post("/autocomplete/batch", json={
+            "texts": ["hello"],
+            "model": "ngram",
+            "tokenizer": "bpe",
+        })
+        assert resp.status_code == 422
+
+    def test_default_tokenizer_is_word(self):
+        """Omitting the field must keep the pre-PR behaviour — the
+        cache key lands under 'lstm:word' / 'transformer:word'."""
+        from src.api import main as api_main
+        from src.neural_model import HAS_TORCH
+        if not HAS_TORCH:
+            return  # covered by the 503 tests above
+        # Drain any prior state so we observe the default key.
+        for k in list(api_main._model_cache):
+            if k.startswith("lstm"):
+                api_main._model_cache.pop(k, None)
+        resp = client.post("/autocomplete", json={
+            "text": "machine learning",
+            "model": "lstm",
+        })
+        assert resp.status_code == 200
+        assert "lstm:word" in api_main._model_cache
+
+    def test_bpe_returns_503_without_transformers(self, monkeypatch):
+        """tokenizer='bpe' on an install without 'transformers' must 503
+        with a clear message instead of a generic ImportError."""
+        from src.api import main as api_main
+        monkeypatch.setattr(api_main, "_bpe_available", lambda: False)
+        for k in list(api_main._model_cache):
+            if "bpe" in k:
+                api_main._model_cache.pop(k, None)
+        resp = client.post("/autocomplete", json={
+            "text": "machine learning",
+            "model": "lstm",
+            "tokenizer": "bpe",
+        })
+        # Needs torch to even reach the bpe-available check; on a torch
+        # install, 503 fires from _maybe_build_bpe_tokenizer. On a
+        # no-torch install, the earlier lstm 503 fires instead — either
+        # way, the client sees a 503 with a helpful message.
+        assert resp.status_code == 503
+        detail = resp.json().get("detail", "")
+        assert ("BPE" in detail) or ("PyTorch" in detail)
 
 
 class TestVocabStats:
