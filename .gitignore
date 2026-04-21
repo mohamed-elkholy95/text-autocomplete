@@ -21,6 +21,7 @@ metrics/
 .vscode/
 CLAUDE.local.md
 context.local.md
+*.local.md
 tasks/
 .claude/
 .envrc
