@@ -203,7 +203,7 @@ def cmd_eval(args: argparse.Namespace) -> None:
         tokens, test_ratio=args.test_ratio, seed=RANDOM_SEED,
     )
 
-    # Train both models
+    # Train the statistical models.
     print("🔧 Training n-gram model...")
     ngram = NGramModel(n=args.n or 3)
     ngram.fit(train_tokens)
@@ -212,56 +212,87 @@ def cmd_eval(args: argparse.Namespace) -> None:
     markov = MarkovChainModel()
     markov.fit(train_tokens)
 
-    # Compute perplexity
-    ngram_ppl = compute_perplexity(ngram, test_tokens)
-    markov_ppl = compute_perplexity(markov, test_tokens)
+    models: "list[tuple[str, object, int]]" = [
+        ("N-gram", ngram, (args.n or 3) - 1),
+        ("Markov", markov, 1),
+    ]
 
-    # Compute accuracy and diversity
-    # Generate predictions for each test position
-    predictions_ngram = []
-    predictions_markov = []
-    ground_truth = []
+    if args.include_lstm:
+        if not HAS_TORCH:
+            print("⚠️  --include-lstm requested but PyTorch is not installed; skipping.")
+        else:
+            print(f"🔧 Training LSTM ({args.lstm_epochs} epoch(s))...")
+            lstm = LSTMModel(embed_dim=64, hidden_dim=128, num_layers=2)
+            lstm.fit(
+                train_tokens,
+                epochs=args.lstm_epochs,
+                seq_len=min(32, max(len(train_tokens) // 4, 4)),
+                batch_size=32,
+                lr=1e-3,
+            )
+            models.append(("LSTM", lstm, max((args.n or 3) - 1, 1)))
 
-    context_len = (args.n or 3) - 1
-    for i in range(context_len, min(len(test_tokens) - 1, 500)):
-        ctx = test_tokens[i - context_len:i]
+    predictions: "dict[str, list[list[str]]]" = {name: [] for name, _, _ in models}
+    ground_truth: "list[str]" = []
+
+    max_ctx = max(ctx for _, _, ctx in models)
+    for i in range(max_ctx, min(len(test_tokens) - 1, 500)):
         truth = test_tokens[i]
         ground_truth.append(truth)
-
-        preds_n = ngram.predict_next(ctx, top_k=args.top_k)
-        preds_m = markov.predict_next(ctx, top_k=args.top_k)
-        predictions_ngram.append([w for w, _ in preds_n])
-        predictions_markov.append([w for w, _ in preds_m])
-
-    acc_ngram = autocomplete_accuracy(predictions_ngram, ground_truth, top_k=1)
-    acc_markov = autocomplete_accuracy(predictions_markov, ground_truth, top_k=1)
-    div_ngram = prediction_diversity(predictions_ngram)
-    div_markov = prediction_diversity(predictions_markov)
+        for name, model, ctx_len in models:
+            preds = model.predict_next(test_tokens[i - ctx_len:i], top_k=args.top_k)
+            predictions[name].append([w for w, _ in preds])
 
     vocab_set = set(test_tokens)
-    cov_ngram = vocabulary_coverage(predictions_ngram, vocab_set)
-    cov_markov = vocabulary_coverage(predictions_markov, vocab_set)
+    per_model = {}
+    for name, model, _ in models:
+        per_model[name] = {
+            "ppl": compute_perplexity(model, test_tokens),
+            "top1": autocomplete_accuracy(predictions[name], ground_truth, top_k=1),
+            "div": prediction_diversity(predictions[name]),
+            "cov": vocabulary_coverage(predictions[name], vocab_set),
+        }
 
-    # Print report
-    print("\n" + "=" * 60)
+    names = [name for name, _, _ in models]
+    col_w = 12
+    header = f"{'Metric':<30}" + "".join(f"{name:>{col_w}}" for name in names)
+    print("\n" + "=" * len(header))
     print("          TEXT AUTOCOMPLETE — EVALUATION REPORT")
-    print("=" * 60)
-    print(f"\n{'Metric':<30} {'N-gram':>12} {'Markov':>12}")
-    print("-" * 54)
-    print(f"{'Perplexity (↓ better)':<30} {ngram_ppl:>12.2f} {markov_ppl:>12.2f}")
-    print(f"{'Top-1 Accuracy (↑ better)':<30} {acc_ngram:>11.2%} {acc_markov:>11.2%}")
-    print(f"{'Prediction Diversity':<30} {div_ngram:>11.2%} {div_markov:>11.2%}")
-    print(f"{'Vocabulary Coverage':<30} {cov_ngram:>11.2%} {cov_markov:>11.2%}")
-    print("-" * 54)
+    print("=" * len(header))
+    print("\n" + header)
+    print("-" * len(header))
+    rows = (
+        ("Perplexity (↓ better)", "ppl", False),
+        ("Top-1 Accuracy (↑ better)", "top1", True),
+        ("Prediction Diversity", "div", True),
+        ("Vocabulary Coverage", "cov", True),
+    )
+    for label, key, pct in rows:
+        row = f"{label:<30}"
+        for name in names:
+            v = per_model[name][key]
+            row += f"{v:>{col_w}.2%}" if pct else f"{v:>{col_w}.2f}"
+        print(row)
+    print("-" * len(header))
 
-    # Determine winner
-    ngram_wins = sum([
-        ngram_ppl < markov_ppl,
-        acc_ngram > acc_markov,
-        div_ngram > div_markov,
-    ])
-    winner = "N-gram" if ngram_wins >= 2 else "Markov"
-    print(f"\n🏆 Overall winner: {winner} (won {max(ngram_wins, 3 - ngram_wins)}/3 metrics)")
+    # Rank-sum winner: lower perplexity wins; higher top1/div/cov win.
+    def rank(metric_key: str, higher_is_better: bool) -> dict:
+        vals = sorted(
+            ((name, per_model[name][metric_key]) for name in names),
+            key=lambda x: x[1], reverse=higher_is_better,
+        )
+        return {name: i for i, (name, _) in enumerate(vals)}  # 0 = best
+
+    rankings = [
+        rank("ppl", False),
+        rank("top1", True),
+        rank("div", True),
+        rank("cov", True),
+    ]
+    scores = {name: sum(r[name] for r in rankings) for name in names}
+    winner = min(scores, key=scores.get)
+    wins = sum(1 for r in rankings if r[winner] == 0)
+    print(f"\n🏆 Overall winner: {winner} (best on {wins}/{len(rankings)} metrics)")
 
 
 def cmd_info(args: argparse.Namespace) -> None:
@@ -372,6 +403,14 @@ Examples:
     eval_parser.add_argument(
         "--top-k", type=int, default=TOP_K,
         help=f"Top-k for accuracy (default: {TOP_K})",
+    )
+    eval_parser.add_argument(
+        "--include-lstm", action="store_true",
+        help="Also train and report an LSTM alongside ngram + markov (requires PyTorch).",
+    )
+    eval_parser.add_argument(
+        "--lstm-epochs", type=int, default=3,
+        help="Training epochs when --include-lstm is passed (default: 3).",
     )
 
     # --- info subcommand ---
