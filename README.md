@@ -5,7 +5,7 @@
 **N-gram, Markov Chain & Beam Search language models** for text completion with perplexity evaluation
 
 [![Python](https://img.shields.io/badge/Python-3.12%2B-3776AB?style=flat-square&logo=python)](https://python.org)
-[![Tests](https://img.shields.io/badge/Tests-173%20passed-success?style=flat-square)](#)
+[![Tests](https://img.shields.io/badge/Tests-175%20passed-success?style=flat-square)](#)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.100%2B-009688?style=flat-square)](https://fastapi.tiangolo.com)
 [![Streamlit](https://img.shields.io/badge/Streamlit-1.36%2B-FF4B4B?style=flat-square)](https://streamlit.io)
 [![License](https://img.shields.io/badge/License-MIT-blue?style=flat-square)](LICENSE)
@@ -23,7 +23,7 @@ A comprehensive **text autocomplete system** that demonstrates multiple approach
 All three models implement the same `fit(tokens)` / `predict_next(context, top_k)` contract so they are interchangeable behind the beam-search decoder and the API.
 - **N-gram Model** — Unigram through 4-gram with **backoff** *and* **interpolation** smoothing, configurable min-frequency pruning, and JSON save/load
 - **Markov Chain Model** — First-order Markov chain with Laplace smoothing, temperature-controlled text generation, and transition inspection
-- **LSTM Neural Model** — PyTorch LSTM (word-level, CUDA-aware) with a deterministic mock fallback when torch isn't installed. Trained checkpoints persist as a `safetensors`-weights + JSON-metadata bundle (no code execution on load — `torch.save` is deliberately avoided for the same reason JSON is used elsewhere).
+- **LSTM Neural Model** — PyTorch LSTM with weight tying (Press & Wolf 2016), a configurable `vocab_cap` that routes rare tokens to `<unk>`, `bfloat16` autocast on CUDA, and a deterministic mock fallback when torch isn't installed. Trained checkpoints persist as a `safetensors`-weights + JSON-metadata bundle at schema v2 (no code execution on load — `torch.save` is deliberately avoided for the same reason JSON is used elsewhere).
 
 ### 🔍 Advanced Decoding
 - **Beam Search** — Multi-hypothesis decoding with length-normalized scoring (`score = log_prob / length^α`), configurable beam width and search depth
@@ -65,7 +65,7 @@ All three models implement the same `fit(tokens)` / `predict_next(context, top_k
 git clone https://github.com/mohamed-elkholy95/text-autocomplete.git
 cd text-autocomplete
 pip install -r requirements.txt          # torch is optional — LSTM falls back to a mock if it's missing
-python -m pytest tests/ -v                # 173 tests across 8 files
+python -m pytest tests/ -v                # 175 tests across 8 files
 
 # Pick one frontend:
 streamlit run streamlit_app/app.py                              # interactive dashboard
@@ -85,10 +85,10 @@ python cli.py train --model ngram --n 3 --save models/ngram_3.json --eval
 python cli.py train --model markov --save models/markov.json
 
 # Train an LSTM (requires PyTorch). Save path produces a pair of files:
-#   models/lstm.safetensors  — tensor weights
+#   models/lstm.safetensors  — tensor weights (tied embedding, schema v2)
 #   models/lstm.json         — vocabulary, hyperparameters, schema version
 python cli.py train --model lstm --epochs 3 --embed-dim 64 --hidden-dim 128 \
-    --num-layers 2 --save models/lstm
+    --num-layers 2 --vocab-cap 10000 --save models/lstm
 
 # Get autocomplete predictions (visualised with probability bars)
 python cli.py predict --text "machine learning is" --top-k 5
@@ -126,7 +126,7 @@ text-autocomplete/
 │       ├── 1_📊_Overview.py
 │       ├── 2_✍️_Autocomplete.py
 │       └── 3_📈_Metrics.py
-├── tests/                  # 173 tests across 8 files
+├── tests/                  # 175 tests across 8 files
 │   ├── test_ngram.py
 │   ├── test_markov.py
 │   ├── test_beam_search.py
@@ -278,7 +278,7 @@ beams = decoder.search(ngram, context_tokens=["machine", "learning"])
 ## Running Tests
 
 ```bash
-# All tests (173 across 8 test files)
+# All tests (175 across 8 test files)
 python -m pytest tests/ -v
 
 # Specific test file
@@ -297,35 +297,51 @@ runs are reproducible via `scripts/bench_real_data.py`; the LSTM column
 was produced in the same harness on the same split (hyperparameters noted
 below the table).
 
-| Model | Corpus | Perplexity ↓ | Top-1 Acc ↑ | Top-5 Acc ↑ | Notes |
-| --- | --- | ---: | ---: | ---: | --- |
-| Trigram (n=3, min_freq=2) | WikiText-2 (full 1.87 M train) | 1,643.6 | 5.00 % | 11.00 % | Backoff smoothing |
-| Markov chain (Laplace) | WikiText-2 (full 1.87 M train) | 13,998.8 | 4.80 % | 12.70 % | First-order only |
-| LSTM (embed 96 / hidden 192 / 2 layers) | WikiText-2 (200 k-token subset, 1 epoch) | **1,301.1** | 4.60 % | **13.80 %** | 17.7 k vocab, 12 s on an RTX 5080 |
+| Model | Corpus | Perplexity ↓ | Top-1 Acc ↑ | Top-5 Acc ↑ | Diversity ↑ | Notes |
+| --- | --- | ---: | ---: | ---: | ---: | --- |
+| Trigram (n=3, min_freq=2) | WikiText-2 (full 1.87 M train) | 1,643.6 | 5.00 % | 11.00 % | 13.80 % | Backoff smoothing |
+| Markov chain (Laplace) | WikiText-2 (full 1.87 M train) | 13,998.8 | 4.80 % | 12.70 % | 9.60 % | First-order only |
+| LSTM v1 (untied, no cap) | WikiText-2 (200 k subset, 3 epochs) | 773.3 | — | 19.70 % | 0.20 % | 17.7 k vocab, 3.2 s on RTX 5080 |
+| **LSTM v2 (tied, cap=10k, bf16)** | WikiText-2 (200 k subset, 3 epochs) | **694.6** | 4.60 % | 16.10 % | **1.70 %** | 10 k vocab, 2.7 s on RTX 5080 |
 
-The LSTM was trained on a 200 k-token subset so the end-to-end run fits
-in ~12 s on a single GPU — the numbers are *deliberately under-trained*
-to document the minimum-effort baseline. They still beat the trigram on
-perplexity (−21 %) and top-5 accuracy (+2.8 pp), and crush the Markov
-chain on perplexity (−91 %). Top-1 is slightly below the trigram because
-one epoch isn't enough to sharpen the softmax — add epochs or train on
-the full corpus to close that gap.
+Both LSTM rows are trained on a 200 k-token subset so the full end-to-end
+run (train + evaluate + save) fits in ~3 s on a single GPU — these are
+*deliberately under-trained* baselines. Scale the training subset or
+increase epochs to trade wall time for quality.
 
-**Reproducing the LSTM run** (requires PyTorch + a compatible GPU; see
+**Reading the trade-off.** `LSTM v2` adds weight tying (Press & Wolf 2016),
+a `vocab_cap` that routes rare tokens to `<unk>`, and `bfloat16` autocast.
+Perplexity improves (−10 % over v1, −58 % over the trigram) and
+**diversity jumps 8.5×** because the long-tail softmax no longer pulls
+the model toward a handful of function words. Top-5 *drops* in v2 — that's
+by design: `<unk>` now competes for softmax mass, and after only 3 epochs
+it's easy to predict. Top-k recovers past the v1 number with more epochs
+or full-corpus training; perplexity and diversity are what the cap was
+optimising for.
+
+**Reproducing the runs** (requires PyTorch + a compatible GPU; see
 `scripts/bench_real_data.py` for the corpus setup):
 
 ```bash
-# After scripts/bench_real_data.py has cached data/wikitext2/wikitext2_train.txt
+# Once scripts/bench_real_data.py has cached data/wikitext2/wikitext2_train.txt:
 python cli.py train --model lstm \
-    --epochs 1 --seq-len 32 --embed-dim 96 --hidden-dim 192 --num-layers 2 \
-    --save models/lstm_wikitext2
+    --epochs 3 --seq-len 32 --embed-dim 96 --hidden-dim 192 --num-layers 2 \
+    --vocab-cap 10000 --save models/lstm_wikitext2
 python cli.py predict --model lstm --load models/lstm_wikitext2 \
     --text "in the nineteenth century" --top-k 5
 ```
 
-Perplexity on the LSTM is computed via token-level cross-entropy (the
-`compute_perplexity()` helper in `src/evaluation.py` only handles the
-n-gram and Markov contracts; neural models get the direct softmax path).
+Drop `--vocab-cap` to reproduce the v1 row; increase `--epochs` to
+close the top-k gap versus the trigram. Perplexity on the LSTM is
+computed via token-level cross-entropy (the `compute_perplexity()`
+helper in `src/evaluation.py` only handles the n-gram and Markov
+contracts; neural models get the direct softmax path).
+
+**Checkpoint format.** LSTM bundles are schema v2 — a `.safetensors`
+file for the tied embedding / LSTM / projection weights plus a `.json`
+file with the vocabulary and hyperparameters. Older schema-v1 bundles
+are refused with a clear retrain message because the tied-layer
+state-dict layout can't be migrated losslessly.
 
 ### Small-corpus note
 
