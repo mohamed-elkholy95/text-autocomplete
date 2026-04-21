@@ -88,12 +88,19 @@ class LSTMModel(nn.Module if HAS_TORCH else object):
         self.fc = nn.Linear(self._embed_dim, vocab_size, bias=False)
         self.fc.weight = self.embedding.weight
 
-    def forward(self, x: Any) -> Any:
+    def forward(self, x: Any, hidden: Any = None) -> Any:
+        """Forward pass. When ``hidden`` is provided, returns
+        ``(logits, new_hidden)`` for stateful training; otherwise returns
+        ``logits`` only so the existing ``predict_next_lstm`` path keeps
+        its shape."""
         if not HAS_TORCH:
             return None
         emb = self.embedding(x)
-        lstm_out, _ = self.lstm(emb)
-        return self.fc(self.proj(lstm_out))
+        if hidden is None:
+            lstm_out, _ = self.lstm(emb)
+            return self.fc(self.proj(lstm_out))
+        lstm_out, new_hidden = self.lstm(emb, hidden)
+        return self.fc(self.proj(lstm_out)), new_hidden
 
     # ------------------------------------------------------------------
     # Shared contract: fit(tokens) / predict_next(context, top_k)
@@ -106,6 +113,7 @@ class LSTMModel(nn.Module if HAS_TORCH else object):
         batch_size: int = 32,
         lr: float = 1e-3,
         use_compile: bool = False,
+        stateful: bool = False,
     ) -> "LSTMModel":
         """Fit the model on a token list. Trains when torch is present,
         otherwise just builds the vocabulary so predict_next stays usable.
@@ -142,6 +150,7 @@ class LSTMModel(nn.Module if HAS_TORCH else object):
                 batch_size=batch_size,
                 lr=lr,
                 use_compile=use_compile,
+                stateful=stateful,
             )
         self._is_fitted = True
         return self
@@ -360,14 +369,13 @@ def train_lstm(
     model: Any, tokens: List[int], vocab_size: int, epochs: int = 5,
     seq_len: int = 20, batch_size: int = 32, lr: float = 1e-3,
     grad_clip: float = 1.0, use_amp: bool = True, use_compile: bool = False,
+    stateful: bool = False,
 ) -> Dict[str, List[float]]:
     """Train the LSTM language model on a flat token stream.
 
     The token stream is reshaped into ``batch_size`` parallel sequences
     (classic PyTorch language-modelling layout). Each step consumes a
-    ``(batch_size, seq_len)`` window — in contrast to the previous
-    implementation which always ran at batch=1 because of a stray
-    ``unsqueeze(0)`` that ignored the ``batch_size`` argument entirely.
+    ``(batch_size, seq_len)`` window.
 
     Training hygiene: gradient clipping keeps the LSTM stable over
     multi-epoch runs; a cosine LR schedule decays the Adam learning rate
@@ -377,6 +385,19 @@ def train_lstm(
     the forward + loss run under ``torch.autocast(dtype=bfloat16)``.
     bfloat16 has fp32's exponent range, so no loss scaler is needed; the
     tied-embedding checkpoint is still stored in fp32 on disk.
+
+    Stateful BPTT (``stateful=True``, opt-in): the LSTM's ``(h, c)``
+    hidden state is carried from one ``seq_len`` window to the next
+    along the same row, with ``.detach()`` between windows so backprop
+    stays truncated to a single window. This lets the model condition
+    on effectively unbounded history at forward time without blowing up
+    memory or gradient compute. Hidden state is reset to zeros at the
+    start of each epoch. **Default is stateless** because on the
+    200k-subset / 3-5 epoch benchmark the two paths are within a few
+    percent PPL of each other and the stateless path had the nicer
+    number; stateful's real value shows up at larger training budgets
+    (more epochs / fuller corpora / longer seq_len) where longer
+    effective context actually matters.
     """
     if not HAS_TORCH or not isinstance(model, nn.Module):
         logger.info("Mock training")
@@ -417,16 +438,37 @@ def train_lstm(
         data = data.view(batch_size, n_steps)
         effective_batch = batch_size
 
+    def _fresh_hidden():
+        # num_layers and hidden_dim live on the LSTMModel instance, not on
+        # the compiled wrapper — reach through ``_orig_mod`` if torch.compile
+        # was applied. Both zero tensors keep the stateful forward's signature
+        # uniform (no None branch) so the training loop never has to ask
+        # "am I on the first iteration?".
+        inner = getattr(model, "_orig_mod", model)
+        nl, hd = inner._num_layers, inner._hidden_dim
+        return (
+            torch.zeros(nl, effective_batch, hd, device=device),
+            torch.zeros(nl, effective_batch, hd, device=device),
+        )
+
     model.train()
     for epoch in range(epochs):
         total_loss = 0.0
         n_batch = 0
+        hidden = _fresh_hidden() if stateful else None  # reset at each epoch
         for i in range(0, data.size(1) - seq_len - 1, seq_len):
             x = data[:, i:i+seq_len]
             y = data[:, i+1:i+seq_len+1]
             optimizer.zero_grad()
             with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=amp_enabled):
-                logits = model(x)
+                if stateful:
+                    logits, hidden = model(x, hidden)
+                    # Truncate BPTT to this window — without detach, grads
+                    # would propagate into the previous window's graph, which
+                    # keeps growing until we OOM.
+                    hidden = tuple(h.detach() for h in hidden)
+                else:
+                    logits = model(x)
                 loss = criterion(logits.reshape(-1, vocab_size), y.reshape(-1))
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
@@ -442,10 +484,11 @@ def train_lstm(
         history["perplexity"].append(round(float(ppl), 4))
         history["lr"].append(round(current_lr, 6))
         logger.info(
-            "LSTM Epoch %d/%d: loss=%.4f ppl=%.1f lr=%.2e batch=%d amp=%s compile=%s",
+            "LSTM Epoch %d/%d: loss=%.4f ppl=%.1f lr=%.2e batch=%d amp=%s compile=%s stateful=%s",
             epoch + 1, epochs, avg, ppl, current_lr, effective_batch,
             "bf16" if amp_enabled else "off",
             "on" if compiled else "off",
+            "on" if stateful else "off",
         )
 
     return history
