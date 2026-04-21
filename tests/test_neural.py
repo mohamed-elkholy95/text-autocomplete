@@ -139,6 +139,30 @@ class TestLSTMPersistence:
         with pytest.raises(ValueError, match="model_type"):
             LSTMModel.load(str(path))
 
+    def test_perplexity_is_finite_after_fit(self):
+        """A fit LSTM should report a finite, positive perplexity and the
+        evaluation dispatcher must route neural models to it instead of
+        short-circuiting to infinity (the pre-PR behaviour)."""
+        from src.evaluation import compute_perplexity
+
+        tokens = self._tiny_corpus()
+        model = LSTMModel(embed_dim=8, hidden_dim=16, num_layers=1)
+        model.fit(tokens, epochs=1, seq_len=4, batch_size=2)
+
+        ppl_direct = model.perplexity(tokens)
+        ppl_dispatched = compute_perplexity(model, tokens)
+
+        assert ppl_direct < float("inf")
+        assert ppl_direct > 0.0
+        # Both paths must use identical defaults so the dispatcher is
+        # a true passthrough, not a silent reinterpretation.
+        assert ppl_direct == ppl_dispatched
+
+    def test_perplexity_returns_inf_before_fit(self):
+        """Unfit models must not pretend to have learned anything."""
+        model = LSTMModel()
+        assert model.perplexity(["anything", "at", "all"]) == float("inf")
+
     def test_vocab_cap_collapses_rare_tokens_to_unk(self):
         """With vocab_cap=N, the trained vocab has exactly N entries and
         <unk> is the id for anything that didn't make the top-(N-1)."""

@@ -39,16 +39,22 @@ def compute_perplexity(model: Any, tokens: List[str]) -> float:
     - PPL = |V|: No better than random guessing from the vocabulary
 
     Args:
-        model: A model with a perplexity(tokens) method (NGramModel or MarkovChainModel).
+        model: A fitted model with a ``perplexity(tokens)`` method. All
+            three first-class model families (NGramModel, MarkovChainModel,
+            LSTMModel) implement it, using count-based probabilities for
+            the statistical models and token-level cross-entropy for the
+            neural one.
         tokens: Token sequence to evaluate on.
 
     Returns:
-        Perplexity score (float). Lower is better.
+        Perplexity score (float). Lower is better. Returns ``inf`` for
+        model types that don't advertise a ``perplexity`` method.
     """
     from src.ngram_model import NGramModel
     from src.markov_model import MarkovChainModel
+    from src.neural_model import LSTMModel
 
-    if isinstance(model, (NGramModel, MarkovChainModel)):
+    if isinstance(model, (NGramModel, MarkovChainModel, LSTMModel)):
         return model.perplexity(tokens)
     return float("inf")
 
