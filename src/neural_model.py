@@ -105,6 +105,7 @@ class LSTMModel(nn.Module if HAS_TORCH else object):
         seq_len: int = 20,
         batch_size: int = 32,
         lr: float = 1e-3,
+        use_compile: bool = False,
     ) -> "LSTMModel":
         """Fit the model on a token list. Trains when torch is present,
         otherwise just builds the vocabulary so predict_next stays usable.
@@ -140,6 +141,7 @@ class LSTMModel(nn.Module if HAS_TORCH else object):
                 seq_len=seq_len,
                 batch_size=batch_size,
                 lr=lr,
+                use_compile=use_compile,
             )
         self._is_fitted = True
         return self
@@ -357,7 +359,7 @@ class LSTMModel(nn.Module if HAS_TORCH else object):
 def train_lstm(
     model: Any, tokens: List[int], vocab_size: int, epochs: int = 5,
     seq_len: int = 20, batch_size: int = 32, lr: float = 1e-3,
-    grad_clip: float = 1.0, use_amp: bool = True,
+    grad_clip: float = 1.0, use_amp: bool = True, use_compile: bool = False,
 ) -> Dict[str, List[float]]:
     """Train the LSTM language model on a flat token stream.
 
@@ -388,6 +390,17 @@ def train_lstm(
     criterion = nn.CrossEntropyLoss()
     history: Dict[str, List[float]] = {"loss": [], "perplexity": [], "lr": []}
     amp_enabled = bool(use_amp and device.type == "cuda" and torch.cuda.is_bf16_supported())
+    # Opt-in torch.compile: ~1.5-2x on Blackwell once the graph is warmed,
+    # but has real warmup overhead (first step can be slow) and some graph
+    # patterns still raise. Gate behind a kwarg and fall back to eager on
+    # any failure so small/CPU runs never break on a compile bug.
+    compiled = False
+    if use_compile:
+        try:
+            model = torch.compile(model)
+            compiled = True
+        except Exception as exc:
+            logger.warning("torch.compile failed (%s); falling back to eager", exc)
 
     # Reshape the flat stream into `batch_size` parallel rows. Rows that
     # don't fit cleanly into `n_steps` tokens are dropped — typical LM
@@ -429,9 +442,10 @@ def train_lstm(
         history["perplexity"].append(round(float(ppl), 4))
         history["lr"].append(round(current_lr, 6))
         logger.info(
-            "LSTM Epoch %d/%d: loss=%.4f ppl=%.1f lr=%.2e batch=%d amp=%s",
+            "LSTM Epoch %d/%d: loss=%.4f ppl=%.1f lr=%.2e batch=%d amp=%s compile=%s",
             epoch + 1, epochs, avg, ppl, current_lr, effective_batch,
             "bf16" if amp_enabled else "off",
+            "on" if compiled else "off",
         )
 
     return history
