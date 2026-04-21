@@ -112,6 +112,7 @@ def cmd_train(args: argparse.Namespace) -> None:
             batch_size=args.batch_size,
             lr=args.lr,
             use_compile=args.compile,
+            stateful=args.stateful,
         )
         elapsed = time.perf_counter() - start
         print(f"✅ LSTM trained in {elapsed:.2f}s")
@@ -371,6 +372,14 @@ Examples:
         "--compile", action="store_true",
         help="LSTM: run the training forward/backward through torch.compile. "
              "Has warmup cost; best on longer runs. Falls back to eager on failure.",
+    )
+    train_parser.add_argument(
+        "--stateful", action="store_true",
+        help="LSTM: enable stateful BPTT — carry the (h, c) hidden state "
+             "across seq_len windows (detached between windows). Default is "
+             "stateless; stateful is opt-in because on short training budgets "
+             "the two are within a few percent of each other and stateless "
+             "has the nicer baseline.",
     )
 
     # --- predict subcommand ---
