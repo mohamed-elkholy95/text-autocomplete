@@ -14,6 +14,8 @@ from collections import Counter
 from src.data_loader import tokenize, load_sample_data
 from src.ngram_model import NGramModel
 from src.markov_model import MarkovChainModel
+from src.neural_model import LSTMModel, HAS_TORCH
+from src.transformer_model import TransformerModel
 from src.beam_search import BeamSearchDecoder
 from src.config import TOP_K
 
@@ -24,15 +26,30 @@ st.title("✍️ Interactive Autocomplete")
 # ---------------------------------------------------------------------------
 @st.cache_resource
 def load_models():
-    """Load and cache trained models. Cached so they persist across reruns."""
+    """Load and cache trained models. Cached so they persist across reruns.
+
+    The neural models (LSTM + Transformer) are only trained when PyTorch
+    is available. Without torch they stay ``None`` and the radio button
+    skips them so the page still works on minimal installs.
+    """
     tokens = tokenize(load_sample_data())
     ngram = NGramModel(n=3)
     ngram.fit(tokens)
     markov = MarkovChainModel()
     markov.fit(tokens)
-    return tokens, ngram, markov
 
-all_tokens, ngram_model, markov_model = load_models()
+    lstm = None
+    xformer = None
+    if HAS_TORCH:
+        lstm = LSTMModel(embed_dim=64, hidden_dim=128, num_layers=2)
+        lstm.fit(tokens, epochs=3, seq_len=min(16, max(len(tokens) // 4, 4)), batch_size=16)
+        xformer = TransformerModel(
+            d_model=64, n_heads=4, n_layers=2, ff_dim=128, max_seq_len=64,
+        )
+        xformer.fit(tokens, epochs=3, seq_len=min(16, max(len(tokens) // 4, 4)), batch_size=16)
+    return tokens, ngram, markov, lstm, xformer
+
+all_tokens, ngram_model, markov_model, lstm_model, transformer_model = load_models()
 
 # ---------------------------------------------------------------------------
 # Main Autocomplete Interface
@@ -48,11 +65,21 @@ text = st.text_area(
 
 top_k = st.slider("Number of suggestions (top-k)", min_value=1, max_value=15, value=TOP_K)
 
+model_options = ["N-gram (Trigram)", "Markov Chain"]
+if lstm_model is not None:
+    model_options.append("LSTM (Neural)")
+if transformer_model is not None:
+    model_options.append("Transformer (Neural)")
+
 model_choice = st.radio(
     "Choose a model",
-    ["N-gram (Trigram)", "Markov Chain"],
+    model_options,
     horizontal=True,
-    help="N-gram uses 2-word context, Markov uses 1-word context.",
+    help=(
+        "N-gram uses 2-word context, Markov uses 1-word context, "
+        "LSTM/Transformer use the full remaining context. Neural models "
+        "require PyTorch; they disappear from the list when torch isn't installed."
+    ),
 )
 
 if st.button("🔮 Predict", type="primary", use_container_width=True):
@@ -65,6 +92,10 @@ if st.button("🔮 Predict", type="primary", use_container_width=True):
         # Select model
         if "Markov" in model_choice:
             model = markov_model
+        elif "LSTM" in model_choice:
+            model = lstm_model
+        elif "Transformer" in model_choice:
+            model = transformer_model
         else:
             model = ngram_model
 
