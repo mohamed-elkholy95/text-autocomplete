@@ -136,6 +136,96 @@ class LSTMModel(nn.Module if HAS_TORCH else object):
     def vocab_size(self) -> int:
         return len(self._word_to_id)
 
+    def save(self, path: str) -> None:
+        """Persist the trained model to a two-file bundle.
+
+        - ``{path}.safetensors`` — tensor weights (no code execution on load)
+        - ``{path}.json``        — vocabulary, hyperparameters, schema version
+
+        Mirrors the ``save`` contract used by :class:`NGramModel` and
+        :class:`MarkovChainModel`. ``torch.save`` is avoided on purpose: it
+        uses a format that can execute arbitrary code on load, which
+        contradicts the project's security anchor (see
+        ``tasks/decisions.md``). ``safetensors`` was designed exactly for
+        this.
+
+        Args:
+            path: Path without extension. Both sibling files are written.
+        """
+        if not self._is_fitted:
+            raise RuntimeError("Cannot save an untrained model. Call fit() first.")
+        if not HAS_TORCH:
+            raise RuntimeError("Saving requires PyTorch; install it first.")
+
+        import json
+        from pathlib import Path
+        from safetensors.torch import save_file
+
+        base = Path(path)
+        weights_path = base.with_suffix(base.suffix + ".safetensors") if base.suffix else base.with_suffix(".safetensors")
+        meta_path = base.with_suffix(base.suffix + ".json") if base.suffix else base.with_suffix(".json")
+        weights_path.parent.mkdir(parents=True, exist_ok=True)
+
+        state = {k: v.detach().cpu().contiguous() for k, v in self.state_dict().items()}
+        save_file(state, str(weights_path))
+
+        meta = {
+            "model_type": "lstm",
+            "schema_version": 1,
+            "vocab": [self._id_to_word[i] for i in range(len(self._id_to_word))],
+            "embed_dim": self._embed_dim,
+            "hidden_dim": self._hidden_dim,
+            "num_layers": self._num_layers,
+            "dropout": self._dropout,
+        }
+        with open(meta_path, "w", encoding="utf-8") as f:
+            json.dump(meta, f, ensure_ascii=False, indent=2)
+
+        logger.info("LSTM saved: weights=%s meta=%s", weights_path, meta_path)
+
+    @classmethod
+    def load(cls, path: str) -> "LSTMModel":
+        """Load a bundle written by :meth:`save`.
+
+        Args:
+            path: Same base path passed to ``save``.
+
+        Returns:
+            A fitted ``LSTMModel`` ready for ``predict_next``.
+        """
+        if not HAS_TORCH:
+            raise RuntimeError("Loading requires PyTorch; install it first.")
+
+        import json
+        from pathlib import Path
+        from safetensors.torch import load_file
+
+        base = Path(path)
+        weights_path = base.with_suffix(base.suffix + ".safetensors") if base.suffix else base.with_suffix(".safetensors")
+        meta_path = base.with_suffix(base.suffix + ".json") if base.suffix else base.with_suffix(".json")
+
+        with open(meta_path, "r", encoding="utf-8") as f:
+            meta = json.load(f)
+        if meta.get("model_type") != "lstm":
+            raise ValueError(f"Expected model_type 'lstm', got '{meta.get('model_type')}'")
+
+        model = cls(
+            vocab_size=len(meta["vocab"]),
+            embed_dim=meta["embed_dim"],
+            hidden_dim=meta["hidden_dim"],
+            num_layers=meta["num_layers"],
+            dropout=meta["dropout"],
+        )
+        model._word_to_id = {w: i for i, w in enumerate(meta["vocab"])}
+        model._id_to_word = {i: w for w, i in model._word_to_id.items()}
+
+        state = load_file(str(weights_path))
+        model.load_state_dict(state)
+        model._is_fitted = True
+
+        logger.info("LSTM loaded: vocab=%d from %s", model.vocab_size, weights_path)
+        return model
+
 
 def train_lstm(
     model: Any, tokens: List[int], vocab_size: int, epochs: int = 5,
@@ -180,9 +270,14 @@ def predict_next_lstm(model: Any, token_ids: List[int], top_k: int = 5) -> List[
     """Predict next token with LSTM."""
     if not HAS_TORCH or not isinstance(model, nn.Module) or not token_ids:
         return [("<UNK>", 0.0)]
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # Match the model's device rather than assuming CUDA: train_lstm already
+    # moved the model; a freshly-loaded checkpoint stays on CPU until used.
+    try:
+        device = next(model.parameters()).device
+    except StopIteration:
+        device = torch.device("cpu")
     model.eval()
-    x = torch.tensor([token_ids[-20:]], dtype=torch.long).to(device)
+    x = torch.tensor([token_ids[-20:]], dtype=torch.long, device=device)
     with torch.no_grad():
         logits = model(x)
     probs = torch.softmax(logits[0, -1], dim=-1).cpu()

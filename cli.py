@@ -46,6 +46,7 @@ from src.data_loader import (
 )
 from src.ngram_model import NGramModel
 from src.markov_model import MarkovChainModel
+from src.neural_model import LSTMModel, HAS_TORCH
 from src.evaluation import (
     compute_perplexity,
     autocomplete_accuracy,
@@ -96,6 +97,26 @@ def cmd_train(args: argparse.Namespace) -> None:
         print(f"✅ Markov chain model trained in {elapsed:.2f}s")
         print(f"   Vocabulary: {model.vocab_size:,} words")
         print(f"   Transitions: {model.n_transitions:,}")
+    elif args.model == "lstm":
+        if not HAS_TORCH:
+            print("❌ LSTM training requires PyTorch. Install it or pick ngram/markov.")
+            sys.exit(1)
+        model = LSTMModel(
+            embed_dim=args.embed_dim,
+            hidden_dim=args.hidden_dim,
+            num_layers=args.num_layers,
+        )
+        model.fit(
+            train_tokens,
+            epochs=args.epochs,
+            seq_len=args.seq_len,
+            batch_size=args.batch_size,
+            lr=args.lr,
+        )
+        elapsed = time.perf_counter() - start
+        print(f"✅ LSTM trained in {elapsed:.2f}s")
+        print(f"   Vocabulary: {model.vocab_size:,} words")
+        print(f"   Params: embed={args.embed_dim}, hidden={args.hidden_dim}, layers={args.num_layers}")
     else:
         print(f"❌ Unknown model: {args.model}")
         sys.exit(1)
@@ -122,8 +143,13 @@ def cmd_predict(args: argparse.Namespace) -> None:
         print(f"📂 Loading model from {args.load}...")
         if args.model == "ngram":
             model = NGramModel.load(args.load)
-        else:
+        elif args.model == "markov":
             model = MarkovChainModel.load(args.load)
+        else:
+            if not HAS_TORCH:
+                print("❌ Loading an LSTM requires PyTorch.")
+                sys.exit(1)
+            model = LSTMModel.load(args.load)
     else:
         print(f"🔄 Training fresh {args.model} model...")
         corpus = load_sample_data()
@@ -131,9 +157,15 @@ def cmd_predict(args: argparse.Namespace) -> None:
         if args.model == "ngram":
             model = NGramModel(n=args.n or 3)
             model.fit(tokens)
-        else:
+        elif args.model == "markov":
             model = MarkovChainModel()
             model.fit(tokens)
+        else:
+            if not HAS_TORCH:
+                print("❌ LSTM requires PyTorch. Use --load or pick ngram/markov.")
+                sys.exit(1)
+            model = LSTMModel()
+            model.fit(tokens, epochs=3)
 
     # Tokenize input and predict
     input_tokens = tokenize(args.text)
@@ -276,7 +308,7 @@ Examples:
     # --- train subcommand ---
     train_parser = subparsers.add_parser("train", help="Train a language model")
     train_parser.add_argument(
-        "--model", choices=["ngram", "markov"], default="ngram",
+        "--model", choices=["ngram", "markov", "lstm"], default="ngram",
         help="Model type to train (default: ngram)",
     )
     train_parser.add_argument(
@@ -285,12 +317,20 @@ Examples:
     )
     train_parser.add_argument(
         "--save", type=str, default=None,
-        help="Path to save the trained model (JSON format)",
+        help="Path to save the trained model. ngram/markov → single JSON; "
+             "lstm → pair of <path>.safetensors + <path>.json.",
     )
     train_parser.add_argument(
         "--eval", action="store_true",
         help="Evaluate on a held-out test set after training",
     )
+    train_parser.add_argument("--epochs", type=int, default=5, help="LSTM: training epochs (default: 5)")
+    train_parser.add_argument("--seq-len", type=int, default=20, help="LSTM: sequence length (default: 20)")
+    train_parser.add_argument("--batch-size", type=int, default=32, help="LSTM: batch size (default: 32)")
+    train_parser.add_argument("--lr", type=float, default=1e-3, help="LSTM: learning rate (default: 1e-3)")
+    train_parser.add_argument("--embed-dim", type=int, default=64, help="LSTM: embedding dim (default: 64)")
+    train_parser.add_argument("--hidden-dim", type=int, default=128, help="LSTM: hidden dim (default: 128)")
+    train_parser.add_argument("--num-layers", type=int, default=2, help="LSTM: number of layers (default: 2)")
 
     # --- predict subcommand ---
     pred_parser = subparsers.add_parser("predict", help="Get autocomplete predictions")
@@ -299,7 +339,7 @@ Examples:
         help="Input text to complete",
     )
     pred_parser.add_argument(
-        "--model", choices=["ngram", "markov"], default="ngram",
+        "--model", choices=["ngram", "markov", "lstm"], default="ngram",
         help="Model type (default: ngram)",
     )
     pred_parser.add_argument(
