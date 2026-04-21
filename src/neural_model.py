@@ -60,6 +60,12 @@ class LSTMModel(nn.Module if HAS_TORCH else object):
         # Cap the vocabulary to the top-N most frequent tokens during fit.
         # Rare tokens map to <unk>. None = no cap (legacy behaviour).
         self._vocab_cap = vocab_cap
+        # Optional external tokenizer (BPETokenizer). When set, the model
+        # uses subword ids directly and skips word-level vocab building.
+        # Populated by fit(..., tokenizer=...) or by load() for schema v3
+        # bundles. None = legacy word-level path.
+        self._tokenizer: Any = None
+        self._bpe_vocab_size: int = 0
 
     def _build_layers(self, vocab_size: int) -> None:
         """Build layers: embedding → LSTM → hidden-to-embed projection → tied logits.
@@ -107,25 +113,38 @@ class LSTMModel(nn.Module if HAS_TORCH else object):
     # ------------------------------------------------------------------
     def fit(
         self,
-        tokens: List[str],
+        data: Any,
         epochs: int = 1,
         seq_len: int = 20,
         batch_size: int = 32,
         lr: float = 1e-3,
         use_compile: bool = False,
         stateful: bool = False,
+        tokenizer: Any = None,
     ) -> "LSTMModel":
-        """Fit the model on a token list. Trains when torch is present,
-        otherwise just builds the vocabulary so predict_next stays usable.
+        """Fit the model. Two modes:
 
-        Vocabulary construction: ``<unk>`` is always ID 0. When
-        ``vocab_cap`` is set, the top-(cap-1) most frequent tokens are
-        kept and everything else collapses to ``<unk>`` — this prevents
-        the long-tail softmax from dominating diversity / coverage
-        metrics on large corpora. With no cap, every observed token gets
-        its own id plus the ``<unk>`` slot (unused during training but
-        available at predict time for OOV context words).
+        **Word-level** (default): ``data`` is a ``List[str]`` of tokens.
+        ``<unk>`` is always id 0. When ``vocab_cap`` is set, the
+        top-(cap-1) most frequent tokens are kept and everything else
+        collapses to ``<unk>``.
+
+        **BPE subword** (``tokenizer`` provided): ``data`` is either raw
+        text (``str``) or a pre-tokenized ``List[str]`` (joined with
+        spaces before encoding). The BPE tokenizer's vocabulary replaces
+        the word-level one — vocab_cap and the ``<unk>`` slot are ignored
+        because byte-level BPE has no true unknowns. The tokenizer's
+        identity is captured for persistence so reloaded checkpoints
+        re-instantiate the same tokenizer.
         """
+        if tokenizer is not None:
+            return self._fit_with_tokenizer(
+                data, tokenizer,
+                epochs=epochs, seq_len=seq_len, batch_size=batch_size,
+                lr=lr, use_compile=use_compile, stateful=stateful,
+            )
+
+        tokens: List[str] = list(data) if not isinstance(data, list) else data
         counts = Counter(tokens)
         if self._vocab_cap is not None and self._vocab_cap > 0:
             kept = [w for w, _ in counts.most_common(self._vocab_cap - 1)]
@@ -155,14 +174,56 @@ class LSTMModel(nn.Module if HAS_TORCH else object):
         self._is_fitted = True
         return self
 
+    def _fit_with_tokenizer(
+        self, data: Any, tokenizer: Any,
+        epochs: int, seq_len: int, batch_size: int, lr: float,
+        use_compile: bool, stateful: bool,
+    ) -> "LSTMModel":
+        """BPE training path — internal, entered when ``fit`` sees a
+        ``tokenizer`` kwarg. Keeps the legacy word-level ``fit`` body
+        unchanged above."""
+        if not HAS_TORCH:
+            raise RuntimeError("BPE training requires PyTorch.")
+        text = data if isinstance(data, str) else " ".join(data)
+        ids = tokenizer.encode(text)
+        if len(ids) < seq_len + 2:
+            raise ValueError(
+                f"BPE-encoded data too short ({len(ids)} ids) for seq_len={seq_len}."
+            )
+
+        self._tokenizer = tokenizer
+        self._bpe_vocab_size = int(tokenizer.vocab_size)
+        # Clear word-level state; the tokenizer owns the vocab now.
+        self._word_to_id = {}
+        self._id_to_word = {}
+
+        self._build_layers(self._bpe_vocab_size)
+        train_lstm(
+            self, ids,
+            vocab_size=self._bpe_vocab_size,
+            epochs=epochs, seq_len=seq_len, batch_size=batch_size,
+            lr=lr, use_compile=use_compile, stateful=stateful,
+        )
+        self._is_fitted = True
+        return self
+
     def predict_next(
         self,
         context: List[str],
         top_k: int = 5,
     ) -> List[Tuple[str, float]]:
-        """Return top-k (word, probability) predictions for the context."""
+        """Return top-k (word, probability) predictions for the context.
+
+        BPE mode (``self._tokenizer`` is not None): joins the context
+        with spaces, encodes via the tokenizer, and decodes each top-k
+        id back to its subword string. Word-level mode keeps the
+        original ``<unk>``-routed behaviour.
+        """
         if not self._is_fitted:
             return [(UNK_TOKEN, 0.0)]
+
+        if self._tokenizer is not None:
+            return self._predict_next_bpe(context, top_k)
 
         # OOV context tokens map to <unk> instead of being silently dropped —
         # so the model actually sees every position, and a context of all-OOV
@@ -185,8 +246,30 @@ class LSTMModel(nn.Module if HAS_TORCH else object):
                 out.append((word, prob))
         return out or [("<UNK>", 0.0)]
 
+    def _predict_next_bpe(
+        self, context: List[str], top_k: int,
+    ) -> List[Tuple[str, float]]:
+        if not HAS_TORCH:
+            return [(UNK_TOKEN, 0.0)]
+        text = " ".join(context) if isinstance(context, list) else str(context)
+        ids = self._tokenizer.encode(text)
+        if not ids:
+            return [(UNK_TOKEN, 0.0)]
+        raw = predict_next_lstm(self, ids, top_k=top_k)
+        out: List[Tuple[str, float]] = []
+        for idx_str, prob in raw:
+            try:
+                idx = int(idx_str)
+            except (TypeError, ValueError):
+                continue
+            subword = self._tokenizer.decode([idx])
+            out.append((subword, prob))
+        return out or [(UNK_TOKEN, 0.0)]
+
     @property
     def vocab_size(self) -> int:
+        if self._tokenizer is not None:
+            return self._bpe_vocab_size
         return len(self._word_to_id)
 
     def perplexity(self, tokens: List[str], seq_len: int = 128) -> float:
@@ -219,8 +302,12 @@ class LSTMModel(nn.Module if HAS_TORCH else object):
         if not isinstance(self, nn.Module):
             return float("inf")
 
-        unk_id = self._word_to_id.get(UNK_TOKEN, 0)
-        ids = [self._word_to_id.get(w, unk_id) for w in tokens]
+        if self._tokenizer is not None:
+            text = tokens if isinstance(tokens, str) else " ".join(tokens)
+            ids = self._tokenizer.encode(text)
+        else:
+            unk_id = self._word_to_id.get(UNK_TOKEN, 0)
+            ids = [self._word_to_id.get(w, unk_id) for w in tokens]
         if len(ids) < 2:
             return float("inf")
 
@@ -296,16 +383,28 @@ class LSTMModel(nn.Module if HAS_TORCH else object):
         state = {k: v.detach().cpu().contiguous() for k, v in self.state_dict().items()}
         save_file(state, str(weights_path))
 
-        meta = {
-            "model_type": "lstm",
-            "schema_version": 2,
-            "vocab": [self._id_to_word[i] for i in range(len(self._id_to_word))],
-            "embed_dim": self._embed_dim,
-            "hidden_dim": self._hidden_dim,
-            "num_layers": self._num_layers,
-            "dropout": self._dropout,
-            "vocab_cap": self._vocab_cap,
-        }
+        if self._tokenizer is not None:
+            meta = {
+                "model_type": "lstm",
+                "schema_version": 3,
+                "tokenizer": {"type": "bpe", "name": self._tokenizer.name},
+                "vocab_size": self._bpe_vocab_size,
+                "embed_dim": self._embed_dim,
+                "hidden_dim": self._hidden_dim,
+                "num_layers": self._num_layers,
+                "dropout": self._dropout,
+            }
+        else:
+            meta = {
+                "model_type": "lstm",
+                "schema_version": 2,
+                "vocab": [self._id_to_word[i] for i in range(len(self._id_to_word))],
+                "embed_dim": self._embed_dim,
+                "hidden_dim": self._hidden_dim,
+                "num_layers": self._num_layers,
+                "dropout": self._dropout,
+                "vocab_cap": self._vocab_cap,
+            }
         with open(meta_path, "w", encoding="utf-8") as f:
             json.dump(meta, f, ensure_ascii=False, indent=2)
 
@@ -338,24 +437,43 @@ class LSTMModel(nn.Module if HAS_TORCH else object):
             raise ValueError(f"Expected model_type 'lstm', got '{meta.get('model_type')}'")
 
         schema = meta.get("schema_version", 1)
-        if schema != 2:
+        if schema not in (2, 3):
             raise ValueError(
                 f"Unsupported LSTM checkpoint schema_version={schema}. "
-                "Schema 2 added weight tying + a hidden→embed projection "
-                "(Press-Wolf 2016); older checkpoints have no tied layer "
-                "and can't be converted losslessly. Retrain and resave."
+                "Schema 2 added weight tying (Press-Wolf 2016); schema 3 "
+                "added the external-tokenizer path. Older checkpoints "
+                "can't be converted losslessly — retrain and resave."
             )
 
-        model = cls(
-            vocab_size=len(meta["vocab"]),
-            embed_dim=meta["embed_dim"],
-            hidden_dim=meta["hidden_dim"],
-            num_layers=meta["num_layers"],
-            dropout=meta["dropout"],
-            vocab_cap=meta.get("vocab_cap"),
-        )
-        model._word_to_id = {w: i for i, w in enumerate(meta["vocab"])}
-        model._id_to_word = {i: w for w, i in model._word_to_id.items()}
+        if schema == 3:
+            from src.bpe_tokenizer import BPETokenizer
+            tok_meta = meta.get("tokenizer", {})
+            if tok_meta.get("type") != "bpe":
+                raise ValueError(
+                    f"Schema 3 LSTM with unsupported tokenizer type '{tok_meta.get('type')}'."
+                )
+            tokenizer = BPETokenizer(name=tok_meta["name"])
+            vocab_size = int(meta["vocab_size"])
+            model = cls(
+                vocab_size=vocab_size,
+                embed_dim=meta["embed_dim"],
+                hidden_dim=meta["hidden_dim"],
+                num_layers=meta["num_layers"],
+                dropout=meta["dropout"],
+            )
+            model._tokenizer = tokenizer
+            model._bpe_vocab_size = vocab_size
+        else:
+            model = cls(
+                vocab_size=len(meta["vocab"]),
+                embed_dim=meta["embed_dim"],
+                hidden_dim=meta["hidden_dim"],
+                num_layers=meta["num_layers"],
+                dropout=meta["dropout"],
+                vocab_cap=meta.get("vocab_cap"),
+            )
+            model._word_to_id = {w: i for i, w in enumerate(meta["vocab"])}
+            model._id_to_word = {i: w for w, i in model._word_to_id.items()}
 
         state = load_file(str(weights_path))
         model.load_state_dict(state)

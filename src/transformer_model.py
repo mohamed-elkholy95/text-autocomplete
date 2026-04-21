@@ -68,6 +68,11 @@ class TransformerModel(nn.Module if HAS_TORCH else object):
         self._id_to_word: Dict[int, str] = {}
         self._is_fitted = False
         self._vocab_cap = vocab_cap
+        # Optional external tokenizer (BPETokenizer). Set by
+        # fit(..., tokenizer=...) or load() of a schema-v2 bundle.
+        # None = legacy word-level path.
+        self._tokenizer: Any = None
+        self._bpe_vocab_size: int = 0
 
     def _build_layers(self, vocab_size: int) -> None:
         if not HAS_TORCH:
@@ -106,6 +111,8 @@ class TransformerModel(nn.Module if HAS_TORCH else object):
 
     @property
     def vocab_size(self) -> int:
+        if self._tokenizer is not None:
+            return self._bpe_vocab_size
         return len(self._word_to_id)
 
     # ------------------------------------------------------------------
@@ -113,17 +120,30 @@ class TransformerModel(nn.Module if HAS_TORCH else object):
     # ------------------------------------------------------------------
     def fit(
         self,
-        tokens: List[str],
+        data: Any,
         epochs: int = 1,
         seq_len: int = 64,
         batch_size: int = 32,
         lr: float = 3e-4,
         grad_clip: float = 1.0,
         use_amp: bool = True,
+        tokenizer: Any = None,
     ) -> "TransformerModel":
-        """Fit on a token list. When torch is absent, builds vocab only so
-        predict_next still returns a sensible ``<unk>`` sentinel and the
-        rest of the test suite stays green on a minimal install."""
+        """Fit on word tokens or on BPE subword ids.
+
+        Word-level (default): ``data`` is a ``List[str]`` with the usual
+        ``<unk>`` + vocab_cap semantics. BPE (``tokenizer`` provided):
+        ``data`` is raw text or a pre-tokenized list, encoded via the
+        tokenizer; vocab_cap is ignored and the tokenizer's full vocab
+        is used directly."""
+        if tokenizer is not None:
+            return self._fit_with_tokenizer(
+                data, tokenizer,
+                epochs=epochs, seq_len=seq_len, batch_size=batch_size,
+                lr=lr, grad_clip=grad_clip, use_amp=use_amp,
+            )
+
+        tokens: List[str] = list(data) if not isinstance(data, list) else data
         counts = Counter(tokens)
         if self._vocab_cap is not None and self._vocab_cap > 0:
             kept = [w for w, _ in counts.most_common(self._vocab_cap - 1)]
@@ -151,6 +171,35 @@ class TransformerModel(nn.Module if HAS_TORCH else object):
         self._is_fitted = True
         return self
 
+    def _fit_with_tokenizer(
+        self, data: Any, tokenizer: Any,
+        epochs: int, seq_len: int, batch_size: int, lr: float,
+        grad_clip: float, use_amp: bool,
+    ) -> "TransformerModel":
+        if not HAS_TORCH:
+            raise RuntimeError("BPE training requires PyTorch.")
+        text = data if isinstance(data, str) else " ".join(data)
+        ids = tokenizer.encode(text)
+        if len(ids) < seq_len + 2:
+            raise ValueError(
+                f"BPE-encoded data too short ({len(ids)} ids) for seq_len={seq_len}."
+            )
+
+        self._tokenizer = tokenizer
+        self._bpe_vocab_size = int(tokenizer.vocab_size)
+        self._word_to_id = {}
+        self._id_to_word = {}
+
+        self._build_layers(self._bpe_vocab_size)
+        _train_transformer(
+            self, ids,
+            vocab_size=self._bpe_vocab_size,
+            epochs=epochs, seq_len=seq_len, batch_size=batch_size,
+            lr=lr, grad_clip=grad_clip, use_amp=use_amp,
+        )
+        self._is_fitted = True
+        return self
+
     def predict_next(
         self,
         context: List[str],
@@ -158,6 +207,23 @@ class TransformerModel(nn.Module if HAS_TORCH else object):
     ) -> List[Tuple[str, float]]:
         if not self._is_fitted or not HAS_TORCH:
             return [(UNK_TOKEN, 0.0)]
+
+        if self._tokenizer is not None:
+            text = " ".join(context) if isinstance(context, list) else str(context)
+            ids = self._tokenizer.encode(text)[-self._max_seq_len:]
+            if not ids:
+                return [(UNK_TOKEN, 0.0)]
+            device = next(self.parameters()).device
+            self.train(False)
+            x = torch.tensor([ids], dtype=torch.long, device=device)
+            with torch.no_grad():
+                logits = self(x)
+            probs = torch.softmax(logits[0, -1], dim=-1).cpu()
+            topk = torch.topk(probs, min(top_k, probs.numel()))
+            return [
+                (self._tokenizer.decode([int(i)]), float(p))
+                for i, p in zip(topk.indices.tolist(), topk.values.tolist())
+            ]
 
         unk_id = self._word_to_id.get(UNK_TOKEN, 0)
         ids = [self._word_to_id.get(w, unk_id) for w in context][-self._max_seq_len:]
@@ -185,8 +251,12 @@ class TransformerModel(nn.Module if HAS_TORCH else object):
         if not isinstance(self, nn.Module):
             return float("inf")
 
-        unk_id = self._word_to_id.get(UNK_TOKEN, 0)
-        ids = [self._word_to_id.get(w, unk_id) for w in tokens]
+        if self._tokenizer is not None:
+            text = tokens if isinstance(tokens, str) else " ".join(tokens)
+            ids = self._tokenizer.encode(text)
+        else:
+            unk_id = self._word_to_id.get(UNK_TOKEN, 0)
+            ids = [self._word_to_id.get(w, unk_id) for w in tokens]
         if len(ids) < 2:
             return float("inf")
 
@@ -243,18 +313,32 @@ class TransformerModel(nn.Module if HAS_TORCH else object):
         state = {k: v.detach().cpu().contiguous() for k, v in self.state_dict().items()}
         save_file(state, str(weights_path))
 
-        meta = {
-            "model_type": "transformer",
-            "schema_version": 1,
-            "vocab": [self._id_to_word[i] for i in range(len(self._id_to_word))],
-            "d_model": self._d_model,
-            "n_heads": self._n_heads,
-            "n_layers": self._n_layers,
-            "ff_dim": self._ff_dim,
-            "max_seq_len": self._max_seq_len,
-            "dropout": self._dropout,
-            "vocab_cap": self._vocab_cap,
-        }
+        if self._tokenizer is not None:
+            meta = {
+                "model_type": "transformer",
+                "schema_version": 2,
+                "tokenizer": {"type": "bpe", "name": self._tokenizer.name},
+                "vocab_size": self._bpe_vocab_size,
+                "d_model": self._d_model,
+                "n_heads": self._n_heads,
+                "n_layers": self._n_layers,
+                "ff_dim": self._ff_dim,
+                "max_seq_len": self._max_seq_len,
+                "dropout": self._dropout,
+            }
+        else:
+            meta = {
+                "model_type": "transformer",
+                "schema_version": 1,
+                "vocab": [self._id_to_word[i] for i in range(len(self._id_to_word))],
+                "d_model": self._d_model,
+                "n_heads": self._n_heads,
+                "n_layers": self._n_layers,
+                "ff_dim": self._ff_dim,
+                "max_seq_len": self._max_seq_len,
+                "dropout": self._dropout,
+                "vocab_cap": self._vocab_cap,
+            }
         with open(meta_path, "w", encoding="utf-8") as f:
             json.dump(meta, f, ensure_ascii=False, indent=2)
         logger.info("Transformer saved: weights=%s meta=%s", weights_path, meta_path)
@@ -276,23 +360,43 @@ class TransformerModel(nn.Module if HAS_TORCH else object):
             meta = json.load(f)
         if meta.get("model_type") != "transformer":
             raise ValueError(f"Expected model_type 'transformer', got '{meta.get('model_type')}'")
-        if meta.get("schema_version", 1) != 1:
-            raise ValueError(
-                f"Unsupported transformer schema_version={meta.get('schema_version')}"
-            )
+        schema = meta.get("schema_version", 1)
+        if schema not in (1, 2):
+            raise ValueError(f"Unsupported transformer schema_version={schema}")
 
-        model = cls(
-            vocab_size=len(meta["vocab"]),
-            d_model=meta["d_model"],
-            n_heads=meta["n_heads"],
-            n_layers=meta["n_layers"],
-            ff_dim=meta["ff_dim"],
-            max_seq_len=meta["max_seq_len"],
-            dropout=meta["dropout"],
-            vocab_cap=meta.get("vocab_cap"),
-        )
-        model._word_to_id = {w: i for i, w in enumerate(meta["vocab"])}
-        model._id_to_word = {i: w for w, i in model._word_to_id.items()}
+        if schema == 2:
+            from src.bpe_tokenizer import BPETokenizer
+            tok_meta = meta.get("tokenizer", {})
+            if tok_meta.get("type") != "bpe":
+                raise ValueError(
+                    f"Schema 2 transformer with unsupported tokenizer type '{tok_meta.get('type')}'."
+                )
+            tokenizer = BPETokenizer(name=tok_meta["name"])
+            vocab_size = int(meta["vocab_size"])
+            model = cls(
+                vocab_size=vocab_size,
+                d_model=meta["d_model"],
+                n_heads=meta["n_heads"],
+                n_layers=meta["n_layers"],
+                ff_dim=meta["ff_dim"],
+                max_seq_len=meta["max_seq_len"],
+                dropout=meta["dropout"],
+            )
+            model._tokenizer = tokenizer
+            model._bpe_vocab_size = vocab_size
+        else:
+            model = cls(
+                vocab_size=len(meta["vocab"]),
+                d_model=meta["d_model"],
+                n_heads=meta["n_heads"],
+                n_layers=meta["n_layers"],
+                ff_dim=meta["ff_dim"],
+                max_seq_len=meta["max_seq_len"],
+                dropout=meta["dropout"],
+                vocab_cap=meta.get("vocab_cap"),
+            )
+            model._word_to_id = {w: i for i, w in enumerate(meta["vocab"])}
+            model._id_to_word = {i: w for w, i in model._word_to_id.items()}
 
         state = load_file(str(weights_path))
         model.load_state_dict(state)

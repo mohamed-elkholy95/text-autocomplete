@@ -186,6 +186,42 @@ class TestLSTMPersistence:
         assert len(preds) > 0
         assert all(prob > 0.0 for _, prob in preds)
 
+    def test_bpe_fit_save_load_round_trip(self, tmp_path):
+        """BPE-trained LSTM: fit on text via tokenizer, save schema-v3
+        bundle, reload, verify the same top-1 prediction comes back and
+        the reloaded model still reports a finite perplexity on the same
+        text (so the evaluation path works end-to-end for BPE too)."""
+        from src.bpe_tokenizer import BPETokenizer, HAS_TRANSFORMERS
+        if not HAS_TRANSFORMERS:
+            pytest.skip("transformers not installed")
+
+        tok = BPETokenizer()
+        text = "machine learning is a subset of artificial intelligence " * 8
+
+        original = LSTMModel(embed_dim=16, hidden_dim=32, num_layers=1)
+        original.fit(text, epochs=1, seq_len=8, batch_size=2, lr=1e-3, tokenizer=tok)
+        assert original._tokenizer is tok
+        assert original.vocab_size == tok.vocab_size
+
+        path = tmp_path / "lstm_bpe"
+        original.save(str(path))
+        # Schema 3 bundle must not contain the legacy 'vocab' word list.
+        import json
+        meta = json.loads((tmp_path / "lstm_bpe.json").read_text(encoding="utf-8"))
+        assert meta["schema_version"] == 3
+        assert meta["tokenizer"]["type"] == "bpe"
+        assert "vocab" not in meta
+
+        reloaded = LSTMModel.load(str(path))
+        assert reloaded.vocab_size == original.vocab_size
+        assert reloaded._tokenizer is not None
+        assert reloaded.perplexity(text) < float("inf")
+
+        ctx = ["machine", "learning"]
+        orig_top = [w for w, _ in original.predict_next(ctx, top_k=3)]
+        reload_top = [w for w, _ in reloaded.predict_next(ctx, top_k=3)]
+        assert orig_top == reload_top
+
     def test_load_rejects_schema_v1(self, tmp_path):
         """v1 checkpoints (pre-weight-tying) must be refused, not silently loaded."""
         import json
