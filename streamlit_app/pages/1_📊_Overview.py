@@ -57,10 +57,22 @@ with tab2:
     2. At prediction time, look up the current word's outgoing edges
     3. Return the top-k highest-probability transitions
 
+    ### The Neural Approaches (LSTM and Transformer)
+    Both read a token sequence, pass it through a learned embedding, and
+    emit a probability distribution over the vocabulary. The LSTM uses a
+    recurrent cell that maintains hidden state across time; the transformer
+    uses causal self-attention so every position attends to all prior
+    positions in parallel. Both families support subword (BPE) tokenization
+    via an optional `BPETokenizer`, which sidesteps the "unseen word"
+    problem the statistical models rely on `<unk>` to cover.
+
     ### Key Difference
-    N-grams consider variable context lengths (1-4 words).
-    Markov chains explicitly model the transition structure as a graph.
-    Both use the same underlying principle: word co-occurrence statistics.
+    N-grams and Markov chains are count-based — no gradients, no training
+    in the neural sense. LSTM and Transformer are gradient-trained neural
+    networks with learned embeddings, tied output weights, and optional
+    subword tokenization. All four implement the same
+    `fit / predict_next / perplexity` contract so the rest of the project
+    stays model-agnostic.
     """)
 
 with tab3:
@@ -109,6 +121,32 @@ with col2:
     - **Interpretability**: ✅ Visualizable as a graph
 
     *Best for: Simple predictions, text generation, educational demos*
+    """)
+
+col3, col4 = st.columns(2)
+
+with col3:
+    st.subheader("LSTM (Neural)")
+    st.markdown("""
+    - **Approach**: Recurrent neural network with tied embedding
+    - **Context**: Full sequence (stateful BPTT optional)
+    - **Training**: AdamW + cosine LR + bf16 autocast, gradient clipping
+    - **Speed**: 🚀 Fast once trained (1-3 ms per token on CUDA)
+    - **Tokenization**: Word-level or BPE subword (opt-in)
+
+    *Best for: Generalising beyond the exact training n-grams*
+    """)
+
+with col4:
+    st.subheader("Decoder-only Transformer")
+    st.markdown("""
+    - **Approach**: Causal self-attention with tied LM head
+    - **Context**: Up to `max_seq_len` tokens via attention (no recurrence)
+    - **Training**: Same AdamW + cosine + bf16 stack as the LSTM
+    - **Speed**: 🚀 Same tier as the LSTM per token; parallel over sequence
+    - **Benchmark**: Beats LSTM on PPL (−24 %) and top-5 (+4 pp) on WikiText-2
+
+    *Best for: Longer-range dependencies; the modern autocomplete default*
     """)
 
 # ---------------------------------------------------------------------------
