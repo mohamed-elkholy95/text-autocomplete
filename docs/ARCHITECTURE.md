@@ -115,10 +115,20 @@ with Laplace (add-k) smoothing so unseen transitions never get probability 0
 temperature parameter for sampling-based generation.
 
 **LSTM (`src/neural_model.py`).**
-`Embedding → 2-layer LSTM (dropout 0.2) → Linear → Softmax`. Torch is an
-*optional* dependency — when it's not installed, `HAS_TORCH=False` and the
-module returns deterministic mock outputs so `pytest` stays green on a
-minimal install.
+`Embedding → 2-layer LSTM (dropout 0.2) → hidden→embed projection →
+tied-weight output` (Press & Wolf 2016). The projection layer lets
+`hidden_dim` and `embed_dim` diverge without breaking tying. Training
+supports `vocab_cap` (top-N frequent tokens; rest collapse to `<unk>`),
+gradient clipping, a cosine LR schedule, `bfloat16` autocast on CUDA,
+and opt-in `torch.compile`. Perplexity is computed via token-level
+cross-entropy (`LSTMModel.perplexity()`) so the evaluation driver can
+compare all three model families head-to-head. Checkpoints persist as
+a `safetensors` weights file plus a JSON metadata sidecar at
+`schema_version=2`; older bundles refuse to load rather than
+silently breaking on the missing tied layer. Torch itself is an
+*optional* dependency — when it's not installed, `HAS_TORCH=False` and
+the module returns deterministic mock outputs so `pytest` stays green
+on a minimal install.
 
 ### 3.3 Beam Search Decoder — `src/beam_search.py`
 
@@ -143,6 +153,12 @@ is kept here for clarity.
 | Vocabulary coverage  | Fraction of vocab the model ever predicts          | `vocabulary_coverage()`       |
 | Confidence           | Top-1 prob, Shannon entropy, top-1/top-2 margin    | `prediction_confidence()`     |
 
+`compute_perplexity()` dispatches on model type — n-gram and Markov use
+count-based probabilities, LSTMs use token-level cross-entropy over
+`seq_len` windows. The neural path maps OOV test tokens to `<unk>` and
+clamps `seq_len` against the test slice length so short slices don't
+silently collapse to `inf`.
+
 ### 3.5 API Layer — `src/api/main.py`
 
 FastAPI with seven endpoints:
@@ -166,7 +182,7 @@ trained once and cached in a module-level dict so requests don't retrain.
 
 | Interface         | Technology | Entry point                    |
 | ----------------- | ---------- | ------------------------------ |
-| CLI               | argparse   | `cli.py {train,predict,eval,info}` |
+| CLI               | argparse   | `cli.py {train,predict,eval,info}` (train takes `--model {ngram,markov,lstm}`, `--vocab-cap`, `--compile`; `eval --include-lstm` adds a three-way comparison column) |
 | REST API          | FastAPI    | `uvicorn src.api.main:app`     |
 | Interactive app   | Streamlit  | `streamlit run streamlit_app/app.py` |
 
