@@ -27,6 +27,7 @@ from src.data_loader import tokenize, train_test_split, get_corpus_stats
 from src.ngram_model import NGramModel
 from src.markov_model import MarkovChainModel
 from src.neural_model import LSTMModel, HAS_TORCH
+from src.transformer_model import TransformerModel
 from src.evaluation import (
     autocomplete_accuracy,
     prediction_diversity,
@@ -42,6 +43,17 @@ LSTM_EPOCHS = 10
 LSTM_SEQ_LEN = 64
 LSTM_BATCH_SIZE = 64
 LSTM_LR = 1e-3
+
+TF_D_MODEL = 128
+TF_N_HEADS = 4
+TF_N_LAYERS = 4
+TF_FF_DIM = 512
+TF_MAX_SEQ_LEN = 128
+TF_VOCAB_CAP = 20000
+TF_EPOCHS = 5
+TF_SEQ_LEN = 64
+TF_BATCH_SIZE = 64
+TF_LR = 3e-4
 
 CACHE_DIR = ROOT / "data" / "wikitext2"
 CORPUS_PATH = CACHE_DIR / "wikitext2_train.txt"
@@ -75,8 +87,8 @@ def eval_stat_model(model, train_tokens, test_tokens, *, n_probe: int = 1000, to
 
     if isinstance(model, NGramModel):
         ctx_len = max(model.n - 1, 1)
-    elif isinstance(model, LSTMModel):
-        ctx_len = 5  # same probe window as the SmolLM2 row — gives the LSTM a fair shot
+    elif isinstance(model, (LSTMModel, TransformerModel)):
+        ctx_len = 5  # same probe window as the SmolLM2 row — fair shot for neural
     else:
         ctx_len = 1
 
@@ -135,10 +147,7 @@ def train_lstm_full(train: list[str]) -> LSTMModel:
     """Train the LSTM on the full WikiText-2 train split.
 
     Uses the PR 1 + PR 2 + PR 10 stack: batched training, gradient clipping,
-    cosine LR, bf16 autocast, weight tying, vocab cap, stateful BPTT. This
-    is the benchmark that was missing — the 200k-subset numbers in the
-    README were deliberately under-trained; this run burns the 10–20 min
-    of GPU time needed to see what the architecture actually can do.
+    cosine LR, bf16 autocast, weight tying, vocab cap, stateful BPTT.
     """
     model = LSTMModel(
         embed_dim=LSTM_EMBED_DIM,
@@ -154,6 +163,33 @@ def train_lstm_full(train: list[str]) -> LSTMModel:
         batch_size=LSTM_BATCH_SIZE,
         lr=LSTM_LR,
         stateful=True,
+    )
+    return model
+
+
+def train_transformer_full(train: list[str]) -> TransformerModel:
+    """Train the decoder-only transformer on the full WikiText-2 train split.
+
+    Mirrors the LSTM config above (same ~20k vocab cap, word-level tokens)
+    so the two neural rows in the report table are apples-to-apples. AdamW
+    + cosine LR + bf16 autocast come from the model's default training
+    loop. Takes a couple minutes on RTX 5080.
+    """
+    model = TransformerModel(
+        d_model=TF_D_MODEL,
+        n_heads=TF_N_HEADS,
+        n_layers=TF_N_LAYERS,
+        ff_dim=TF_FF_DIM,
+        max_seq_len=TF_MAX_SEQ_LEN,
+        dropout=0.1,
+        vocab_cap=TF_VOCAB_CAP,
+    )
+    model.fit(
+        train,
+        epochs=TF_EPOCHS,
+        seq_len=TF_SEQ_LEN,
+        batch_size=TF_BATCH_SIZE,
+        lr=TF_LR,
     )
     return model
 
@@ -193,17 +229,25 @@ def main():
     print(row("ngram", ng_metrics))
     print(row("markov", mk_metrics))
 
-    print("\n[3/4] Train LSTM on full corpus (this takes minutes, not seconds).")
+    print("\n[3/4] Train LSTM + Transformer on full corpus (minutes, not seconds).")
     if HAS_TORCH:
         t0 = time.perf_counter()
         lstm = train_lstm_full(train)
         lstm_fit = time.perf_counter() - t0
         print(f"     lstm fit: {lstm_fit:.1f}s (vocab={lstm.vocab_size})")
         lstm_metrics = eval_stat_model(lstm, train, test, n_probe=1000)
-        print("\n     ── neural model ──")
+
+        t0 = time.perf_counter()
+        xformer = train_transformer_full(train)
+        tf_fit = time.perf_counter() - t0
+        print(f"     transformer fit: {tf_fit:.1f}s (vocab={xformer.vocab_size})")
+        tf_metrics = eval_stat_model(xformer, train, test, n_probe=1000)
+
+        print("\n     ── neural models ──")
         print(row("lstm", lstm_metrics))
+        print(row("xformer", tf_metrics))
     else:
-        print("     torch not available; skipping LSTM row.")
+        print("     torch not available; skipping neural rows.")
 
     print("\n[4/4] Small language model baseline.")
     try:
