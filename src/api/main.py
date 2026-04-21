@@ -267,6 +267,49 @@ def _get_trained_markov():
     return _model_cache["markov"]
 
 
+def _transformer_available() -> bool:
+    """Return True when the transformer path can train/serve.
+
+    The API's optional-torch anchor means the transformer only appears
+    in /models and is only selectable in /autocomplete when PyTorch is
+    importable. Installs without torch keep the pre-PR behaviour
+    (ngram + markov only) with no functional change.
+    """
+    try:
+        from src.neural_model import HAS_TORCH
+        return bool(HAS_TORCH)
+    except Exception:
+        return False
+
+
+def _get_trained_transformer():
+    """Get or create a cached trained decoder-only transformer.
+
+    Uses a deliberately small config (d_model=64, 2 layers, 3 epochs)
+    so the first request finishes in a few seconds on CPU. This mirrors
+    the CLI eval's --include-transformer defaults."""
+    if "transformer" not in _model_cache:
+        if not _transformer_available():
+            raise HTTPException(
+                status_code=503,
+                detail="Transformer model unavailable: PyTorch is not installed.",
+            )
+        from src.data_loader import tokenize, load_sample_data
+        from src.transformer_model import TransformerModel
+        tokens = tokenize(load_sample_data())
+        model = TransformerModel(
+            d_model=64, n_heads=4, n_layers=2, ff_dim=128, max_seq_len=64,
+        )
+        model.fit(
+            tokens, epochs=3,
+            seq_len=min(16, max(len(tokens) // 4, 4)),
+            batch_size=16, lr=3e-4,
+        )
+        _model_cache["transformer"] = model
+        logger.info("Transformer model trained and cached")
+    return _model_cache["transformer"]
+
+
 # ---------------------------------------------------------------------------
 # Request/Response Models (Pydantic)
 # ---------------------------------------------------------------------------
@@ -296,8 +339,12 @@ class AutocompleteRequest(BaseModel):
     )
     model: str = Field(
         default="ngram",
-        pattern="^(ngram|markov)$",
-        description="Language model to use: 'ngram' or 'markov'.",
+        pattern="^(ngram|markov|transformer)$",
+        description=(
+            "Language model to use: 'ngram', 'markov', or (when PyTorch "
+            "is installed) 'transformer'. Selecting 'transformer' on a "
+            "minimal install returns 503."
+        ),
     )
 
 
@@ -381,6 +428,8 @@ async def autocomplete(req: AutocompleteRequest):
     # Select the model
     if req.model == "markov":
         model = _get_trained_markov()
+    elif req.model == "transformer":
+        model = _get_trained_transformer()
     else:
         model = _get_trained_ngram()
 
@@ -422,6 +471,8 @@ async def autocomplete_batch(req: BatchRequest):
     # Select the model once (shared across all texts)
     if req.model == "markov":
         model = _get_trained_markov()
+    elif req.model == "transformer":
+        model = _get_trained_transformer()
     else:
         model = _get_trained_ngram()
 
@@ -452,21 +503,30 @@ async def list_models():
     This endpoint helps API consumers discover what models are available
     and choose the right one for their use case.
     """
-    return {
-        "models": [
-            {
-                "id": "ngram",
-                "name": "N-gram Language Model",
-                "description": "Classic statistical model using word co-occurrence counts. Fast and interpretable.",
-                "max_ngram_order": 3,
-            },
-            {
-                "id": "markov",
-                "name": "Markov Chain Model",
-                "description": "First-order Markov chain with Laplace smoothing. Simple and effective for common word pairs.",
-            },
-        ]
-    }
+    catalogue = [
+        {
+            "id": "ngram",
+            "name": "N-gram Language Model",
+            "description": "Classic statistical model using word co-occurrence counts. Fast and interpretable.",
+            "max_ngram_order": 3,
+        },
+        {
+            "id": "markov",
+            "name": "Markov Chain Model",
+            "description": "First-order Markov chain with Laplace smoothing. Simple and effective for common word pairs.",
+        },
+    ]
+    if _transformer_available():
+        catalogue.append({
+            "id": "transformer",
+            "name": "Decoder-only Transformer",
+            "description": (
+                "Causal self-attention with tied LM head. Beats the LSTM on "
+                "WikiText-2 (-24% PPL, +4 pp top-5) with half the training "
+                "time. Trained lazily on first request; takes a few seconds."
+            ),
+        })
+    return {"models": catalogue}
 
 
 class GenerateRequest(BaseModel):

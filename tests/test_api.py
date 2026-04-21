@@ -184,6 +184,39 @@ class TestListModels:
         assert "ngram" in model_ids
         assert "markov" in model_ids
 
+    def test_list_models_transformer_presence_tracks_torch(self):
+        """The transformer entry must appear iff torch is importable —
+        the API's optional-torch anchor says minimal installs see only
+        the statistical models."""
+        from src.neural_model import HAS_TORCH
+        resp = client.get("/models")
+        data = resp.json()
+        model_ids = [m["id"] for m in data["models"]]
+        if HAS_TORCH:
+            assert "transformer" in model_ids
+        else:
+            assert "transformer" not in model_ids
+
+
+class TestTransformerEndpoint:
+    """Tests for the transformer path in /autocomplete."""
+
+    def test_transformer_returns_503_without_torch(self, monkeypatch):
+        """Selecting 'transformer' on a no-torch install must fail with
+        a clear 503 instead of a generic 500. Simulated by pointing the
+        helper at a fake HAS_TORCH=False."""
+        from src.api import main as api_main
+        monkeypatch.setattr(api_main, "_transformer_available", lambda: False)
+        # Also evict any cached transformer so the helper has to check.
+        api_main._model_cache.pop("transformer", None)
+        resp = client.post("/autocomplete", json={
+            "text": "machine learning is",
+            "top_k": 3,
+            "model": "transformer",
+        })
+        assert resp.status_code == 503
+        assert "PyTorch" in resp.json().get("detail", "")
+
 
 class TestVocabStats:
     """Tests for the vocabulary statistics endpoint."""
