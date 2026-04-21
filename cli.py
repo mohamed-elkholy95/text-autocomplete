@@ -111,6 +111,7 @@ def cmd_train(args: argparse.Namespace) -> None:
             seq_len=args.seq_len,
             batch_size=args.batch_size,
             lr=args.lr,
+            use_compile=args.compile,
         )
         elapsed = time.perf_counter() - start
         print(f"✅ LSTM trained in {elapsed:.2f}s")
@@ -365,6 +366,11 @@ Examples:
         "--vocab-cap", type=int, default=None,
         help="LSTM: cap vocab at top-N most frequent tokens; rest map to <unk>. "
              "Default None = keep every token.",
+    )
+    train_parser.add_argument(
+        "--compile", action="store_true",
+        help="LSTM: run the training forward/backward through torch.compile. "
+             "Has warmup cost; best on longer runs. Falls back to eager on failure.",
     )
 
     # --- predict subcommand ---
