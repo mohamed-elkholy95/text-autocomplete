@@ -251,6 +251,42 @@ class TestLSTMEndpoint:
         assert "PyTorch" in resp.json().get("detail", "")
 
 
+class TestCheckpointLoader:
+    """Tests for the env-var checkpoint loader.
+
+    We don't exercise a real .safetensors bundle here — the loader's
+    model-load path already has its own unit tests in test_neural.py
+    / test_transformer.py. The API-layer concern is: env var missing =
+    fall through to lazy-fit; env var set but file missing = log and
+    fall through; env var set + load succeeds = skip training."""
+
+    def test_env_var_unset_falls_through_to_lazy_fit(self, monkeypatch):
+        from src.api import main as api_main
+        for env in api_main._CHECKPOINT_ENV_VARS.values():
+            monkeypatch.delenv(env, raising=False)
+        assert api_main._try_load_checkpoint("lstm", "word") is None
+        assert api_main._try_load_checkpoint("transformer", "bpe") is None
+
+    def test_env_var_pointing_at_missing_file_falls_through(
+        self, monkeypatch, tmp_path,
+    ):
+        """A bogus path must not crash the endpoint — we log and
+        lazy-fit so the service keeps serving."""
+        from src.api import main as api_main
+        from src.neural_model import HAS_TORCH
+        if not HAS_TORCH:
+            return  # checkpoint path is skipped before the env var is read
+        monkeypatch.setenv(
+            "AUTOCOMPLETE_LSTM_CHECKPOINT_WORD",
+            str(tmp_path / "does_not_exist"),
+        )
+        assert api_main._try_load_checkpoint("lstm", "word") is None
+
+    def test_unknown_model_kind_returns_none(self):
+        from src.api import main as api_main
+        assert api_main._try_load_checkpoint("ngram", "word") is None
+
+
 class TestTokenizerSelector:
     """Tests for the BPE tokenizer flag in /autocomplete and batch."""
 
@@ -297,6 +333,41 @@ class TestTokenizerSelector:
         assert resp.status_code == 200
         assert "lstm:word" in api_main._model_cache
 
+    def test_tokenizer_name_without_bpe_rejected(self):
+        """tokenizer_name is BPE-only — pairing it with tokenizer='word'
+        (or omitting the tokenizer field) must 422."""
+        resp = client.post("/autocomplete", json={
+            "text": "hi",
+            "model": "lstm",
+            "tokenizer_name": "gpt2",
+        })
+        assert resp.status_code == 422
+
+    def test_bogus_tokenizer_name_returns_503(self, monkeypatch):
+        """An HF repo that doesn't resolve must 503, not crash. We
+        short-circuit the fetch by stubbing BPETokenizer to raise."""
+        from src.api import main as api_main
+        if not api_main._bpe_available():
+            return  # covered by the transformers-missing 503 test
+        from src.bpe_tokenizer import BPETokenizer as _Real
+
+        class BadTok(_Real):  # type: ignore[misc]
+            def __init__(self, name: str = "x") -> None:
+                raise RuntimeError(f"simulated HF resolve failure for {name}")
+
+        monkeypatch.setattr("src.bpe_tokenizer.BPETokenizer", BadTok)
+        for k in list(api_main._model_cache):
+            if k.startswith(("lstm:", "transformer:")):
+                api_main._model_cache.pop(k, None)
+        resp = client.post("/autocomplete", json={
+            "text": "hi",
+            "model": "lstm",
+            "tokenizer": "bpe",
+            "tokenizer_name": "this-repo-does-not-exist",
+        })
+        assert resp.status_code == 503
+        assert "Failed to load BPE tokenizer" in resp.json().get("detail", "")
+
     def test_bpe_returns_503_without_transformers(self, monkeypatch):
         """tokenizer='bpe' on an install without 'transformers' must 503
         with a clear message instead of a generic ImportError."""
@@ -321,6 +392,13 @@ class TestTokenizerSelector:
 
 class TestVocabStats:
     """Tests for the vocabulary statistics endpoint."""
+
+    def setup_method(self):
+        # The growing test suite can saturate the shared testclient
+        # rate bucket before the last class runs. Reset it so these
+        # read-only tests aren't order-dependent on bucket state.
+        from src.api.main import _rate_buckets
+        _rate_buckets.clear()
 
     def test_vocab_stats_returns_200(self):
         resp = client.get("/vocab/stats")

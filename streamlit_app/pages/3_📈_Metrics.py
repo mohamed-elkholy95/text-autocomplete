@@ -305,6 +305,140 @@ if st.button("🔗 Show Transitions", use_container_width=True):
 
 
 # ---------------------------------------------------------------------------
+# Quick In-Memory Benchmark (sample corpus, sub-5s)
+# ---------------------------------------------------------------------------
+# Trains all available model families on the already-loaded sample
+# corpus and reports PPL / top-5 / diversity / coverage in one table.
+# The subprocess benchmarks below run against WikiText-2 and take
+# minutes; this one is instant so the page has a useful default action.
+st.divider()
+st.header("⚡ Quick Benchmark — All Models (sample corpus)")
+
+st.markdown(
+    """
+Runs on the same 40-sentence sample corpus already loaded for this
+page. The neural rows appear only when PyTorch is importable, and
+they use a deliberately tiny config so the whole benchmark finishes
+in a couple of seconds. Numbers on a sample this small are the usual
+small-data artefact (inflated PPL, low coverage) — the value is the
+side-by-side comparison, not absolute scores.
+"""
+)
+
+
+def _run_quick_benchmark(train, test, probes=40):
+    """Train and score all model families we can reach. Returns one
+    dict per model: name, ppl, top5, diversity, coverage, fit_s."""
+    from src.evaluation import (
+        compute_perplexity,
+        autocomplete_accuracy,
+        prediction_diversity,
+        vocabulary_coverage,
+    )
+    from src.ngram_model import NGramModel
+    from src.markov_model import MarkovChainModel
+
+    # Shared probe layout: at each position i in test, context is
+    # test[:i] (capped at the last 5 tokens for cheap prediction) and
+    # the ground truth is test[i]. Works for every family because
+    # every family implements predict_next(list, top_k).
+    stops = list(range(5, min(len(test), probes + 5)))
+    gts = [test[i] for i in stops]
+    contexts = [test[max(0, i - 5):i] for i in stops]
+    ref_vocab = set(test)
+
+    results = []
+
+    def score(name: str, model, fit_s: float):
+        preds = [[w for w, _ in model.predict_next(ctx, top_k=5)] for ctx in contexts]
+        ppl = compute_perplexity(model, test)
+        results.append({
+            "Model": name,
+            "PPL": ppl,
+            "Top-5 accuracy": autocomplete_accuracy(preds, gts, top_k=5),
+            "Diversity": prediction_diversity(preds),
+            "Coverage": vocabulary_coverage(preds, ref_vocab),
+            "Fit (s)": fit_s,
+        })
+
+    t0 = time.perf_counter()
+    ng = NGramModel(n=3)
+    ng.fit(train)
+    score("N-gram (n=3)", ng, time.perf_counter() - t0)
+
+    t0 = time.perf_counter()
+    mk = MarkovChainModel()
+    mk.fit(train)
+    score("Markov", mk, time.perf_counter() - t0)
+
+    try:
+        from src.neural_model import LSTMModel, HAS_TORCH
+    except Exception:
+        HAS_TORCH = False
+    if HAS_TORCH:
+        t0 = time.perf_counter()
+        lstm = LSTMModel(embed_dim=32, hidden_dim=64, num_layers=1, dropout=0.0)
+        lstm.fit(train, epochs=3, seq_len=8, batch_size=16, lr=1e-3)
+        score("LSTM (tiny)", lstm, time.perf_counter() - t0)
+
+        try:
+            from src.transformer_model import TransformerModel
+            t0 = time.perf_counter()
+            tfm = TransformerModel(
+                d_model=64, n_heads=4, n_layers=2, ff_dim=128, max_seq_len=64,
+            )
+            tfm.fit(train, epochs=3, seq_len=8, batch_size=16, lr=3e-4)
+            score("Transformer (tiny)", tfm, time.perf_counter() - t0)
+        except Exception:
+            pass
+
+    return results
+
+
+if st.button("⚡ Run quick benchmark", type="primary", use_container_width=True):
+    with st.spinner("Training and scoring all available models..."):
+        rows = _run_quick_benchmark(train_tokens, test_tokens)
+
+    import pandas as pd
+
+    df = pd.DataFrame(rows)
+    st.dataframe(
+        df.style.format({
+            "PPL": "{:.1f}",
+            "Top-5 accuracy": "{:.1%}",
+            "Diversity": "{:.1%}",
+            "Coverage": "{:.1%}",
+            "Fit (s)": "{:.2f}",
+        }),
+        use_container_width=True,
+    )
+
+    fig = go.Figure(go.Bar(
+        x=[r["Model"] for r in rows],
+        y=[r["Top-5 accuracy"] * 100 for r in rows],
+        marker_color=["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728"][: len(rows)],
+        text=[f"{r['Top-5 accuracy']:.1%}" for r in rows],
+        textposition="outside",
+    ))
+    fig.update_layout(
+        title="Top-5 Accuracy by Model (higher is better ↑)",
+        paper_bgcolor="#0e1117", plot_bgcolor="#262730",
+        font_color="white",
+        yaxis_title="Top-5 accuracy (%)",
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+    if len(rows) >= 3:
+        best = max(rows, key=lambda r: r["Top-5 accuracy"])
+        st.info(
+            f"🏆 **{best['Model']}** leads on top-5 accuracy "
+            f"({best['Top-5 accuracy']:.1%}). Expect n-gram to win on "
+            f"this tiny corpus — the neural models need more data to "
+            f"generalise."
+        )
+
+
+# ---------------------------------------------------------------------------
 # Dynamic Benchmarks (subprocess drivers)
 # ---------------------------------------------------------------------------
 # Streamlit can't stream multi-minute GPU benchmarks responsively, so these

@@ -313,12 +313,70 @@ def _bpe_available() -> bool:
         return False
 
 
-def _maybe_build_bpe_tokenizer(tokenizer_flavour: str):
+_CHECKPOINT_ENV_VARS = {
+    ("lstm", "word"): "AUTOCOMPLETE_LSTM_CHECKPOINT_WORD",
+    ("lstm", "bpe"): "AUTOCOMPLETE_LSTM_CHECKPOINT_BPE",
+    ("transformer", "word"): "AUTOCOMPLETE_TRANSFORMER_CHECKPOINT_WORD",
+    ("transformer", "bpe"): "AUTOCOMPLETE_TRANSFORMER_CHECKPOINT_BPE",
+}
+
+
+def _try_load_checkpoint(model_kind: str, tokenizer_flavour: str):
+    """Return a loaded neural model, or None when no usable checkpoint
+    is configured.
+
+    The helper intentionally swallows load errors (file missing, schema
+    mismatch, corrupt bundle) and returns None so the caller falls back
+    to the existing lazy-fit path. Nothing here makes PyTorch required
+    — the caller already gates on ``_lstm_available`` / ``_transformer_available``.
+    """
+    env_var = _CHECKPOINT_ENV_VARS.get((model_kind, tokenizer_flavour))
+    if not env_var:
+        return None
+    path = os.getenv(env_var)
+    if not path:
+        return None
+    try:
+        if model_kind == "lstm":
+            from src.neural_model import LSTMModel
+            model = LSTMModel.load(path)
+        else:
+            from src.transformer_model import TransformerModel
+            model = TransformerModel.load(path)
+    except Exception as exc:
+        logger.warning(
+            "Checkpoint load failed for %s/%s at %s: %s — falling back to lazy-fit.",
+            model_kind, tokenizer_flavour, path, exc,
+        )
+        return None
+    # Guard against a word-level checkpoint being served on a BPE request
+    # (and vice versa). The checkpoint's own _tokenizer attribute is the
+    # source of truth for schema-v3 BPE bundles.
+    has_bpe = getattr(model, "_tokenizer", None) is not None
+    expected_bpe = (tokenizer_flavour == "bpe")
+    if has_bpe != expected_bpe:
+        logger.warning(
+            "Checkpoint at %s is %s but the request asked for %s — "
+            "refusing to serve. Point the right env var at the right file.",
+            path,
+            "BPE-trained" if has_bpe else "word-level",
+            tokenizer_flavour,
+        )
+        return None
+    logger.info(
+        "Loaded %s/%s checkpoint from %s",
+        model_kind, tokenizer_flavour, path,
+    )
+    return model
+
+
+def _maybe_build_bpe_tokenizer(tokenizer_flavour: str, tokenizer_name: Optional[str] = None):
     """Return a BPETokenizer instance or None.
 
     Raises 503 when the caller asked for BPE but 'transformers' isn't
-    installed, so the error surfaces at the API boundary instead of
-    reaching the model layer as a generic ImportError."""
+    installed, or when the requested HF repo can't be resolved — so
+    the error surfaces at the API boundary instead of reaching the
+    model layer as a generic ImportError."""
     if tokenizer_flavour != "bpe":
         return None
     if not _bpe_available():
@@ -329,11 +387,23 @@ def _maybe_build_bpe_tokenizer(tokenizer_flavour: str):
                 "'transformers' package to enable subword mode."
             ),
         )
-    from src.bpe_tokenizer import BPETokenizer
-    return BPETokenizer()
+    from src.bpe_tokenizer import BPETokenizer, DEFAULT_BPE_NAME
+    try:
+        return BPETokenizer(name=tokenizer_name or DEFAULT_BPE_NAME)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                f"Failed to load BPE tokenizer "
+                f"'{tokenizer_name or DEFAULT_BPE_NAME}': {exc}"
+            ),
+        )
 
 
-def _get_trained_transformer(tokenizer_flavour: str = "word"):
+def _get_trained_transformer(
+    tokenizer_flavour: str = "word",
+    tokenizer_name: Optional[str] = None,
+):
     """Get or create a cached trained decoder-only transformer.
 
     Uses a deliberately small config (d_model=64, 2 layers, 3 epochs)
@@ -343,17 +413,34 @@ def _get_trained_transformer(tokenizer_flavour: str = "word"):
     ``tokenizer_flavour`` picks the vocabulary: ``"word"`` (default)
     uses the project's whitespace+regex tokenizer; ``"bpe"`` wires in
     a ``BPETokenizer`` so the model trains on subword ids. BPE and
-    word-level instances are cached independently."""
-    cache_key = f"transformer:{tokenizer_flavour}"
+    word-level instances are cached independently. ``tokenizer_name``
+    is only meaningful when ``tokenizer_flavour='bpe'`` and identifies
+    the HF repo — the cache key embeds the name so different BPE
+    vocabularies don't share a cached model."""
+    suffix = tokenizer_flavour
+    if tokenizer_flavour == "bpe" and tokenizer_name:
+        suffix = f"bpe:{tokenizer_name}"
+    cache_key = f"transformer:{suffix}"
     if cache_key not in _model_cache:
         if not _transformer_available():
             raise HTTPException(
                 status_code=503,
                 detail="Transformer model unavailable: PyTorch is not installed.",
             )
+        if tokenizer_flavour == "word":
+            loaded = _try_load_checkpoint("transformer", tokenizer_flavour)
+            if loaded is not None:
+                _model_cache[cache_key] = loaded
+                return loaded
+        elif tokenizer_name is None:
+            # Default BPE repo still honours the checkpoint env var.
+            loaded = _try_load_checkpoint("transformer", tokenizer_flavour)
+            if loaded is not None:
+                _model_cache[cache_key] = loaded
+                return loaded
         from src.data_loader import tokenize, load_sample_data
         from src.transformer_model import TransformerModel
-        bpe = _maybe_build_bpe_tokenizer(tokenizer_flavour)
+        bpe = _maybe_build_bpe_tokenizer(tokenizer_flavour, tokenizer_name)
         # Raw text for BPE (tokenizer encodes internally); pre-tokenized
         # list for the word-level path.
         raw_text = load_sample_data()
@@ -369,11 +456,14 @@ def _get_trained_transformer(tokenizer_flavour: str = "word"):
             tokenizer=bpe,
         )
         _model_cache[cache_key] = model
-        logger.info("Transformer model (%s) trained and cached", tokenizer_flavour)
+        logger.info("Transformer model (%s) trained and cached", suffix)
     return _model_cache[cache_key]
 
 
-def _get_trained_lstm(tokenizer_flavour: str = "word"):
+def _get_trained_lstm(
+    tokenizer_flavour: str = "word",
+    tokenizer_name: Optional[str] = None,
+):
     """Get or create a cached trained LSTM.
 
     Tiny config (embed=32, hidden=64, 1 layer, 3 epochs) so the first
@@ -382,17 +472,26 @@ def _get_trained_lstm(tokenizer_flavour: str = "word"):
     would load a pre-trained checkpoint via LSTMModel.load() instead.
 
     ``tokenizer_flavour`` picks the vocabulary the same way as the
-    transformer helper."""
-    cache_key = f"lstm:{tokenizer_flavour}"
+    transformer helper. ``tokenizer_name`` is only meaningful with
+    ``tokenizer_flavour='bpe'`` and selects the HF repo."""
+    suffix = tokenizer_flavour
+    if tokenizer_flavour == "bpe" and tokenizer_name:
+        suffix = f"bpe:{tokenizer_name}"
+    cache_key = f"lstm:{suffix}"
     if cache_key not in _model_cache:
         if not _lstm_available():
             raise HTTPException(
                 status_code=503,
                 detail="LSTM model unavailable: PyTorch is not installed.",
             )
+        if tokenizer_flavour == "word" or tokenizer_name is None:
+            loaded = _try_load_checkpoint("lstm", tokenizer_flavour)
+            if loaded is not None:
+                _model_cache[cache_key] = loaded
+                return loaded
         from src.data_loader import tokenize, load_sample_data
         from src.neural_model import LSTMModel
-        bpe = _maybe_build_bpe_tokenizer(tokenizer_flavour)
+        bpe = _maybe_build_bpe_tokenizer(tokenizer_flavour, tokenizer_name)
         raw_text = load_sample_data()
         data = raw_text if bpe is not None else tokenize(raw_text)
         length = len(data) if isinstance(data, list) else len(data.split())
@@ -406,7 +505,7 @@ def _get_trained_lstm(tokenizer_flavour: str = "word"):
             tokenizer=bpe,
         )
         _model_cache[cache_key] = model
-        logger.info("LSTM model (%s) trained and cached", tokenizer_flavour)
+        logger.info("LSTM model (%s) trained and cached", suffix)
     return _model_cache[cache_key]
 
 
@@ -456,13 +555,25 @@ class AutocompleteRequest(BaseModel):
             "and only valid with model='lstm' or 'transformer')."
         ),
     )
+    tokenizer_name: Optional[str] = Field(
+        default=None,
+        max_length=128,
+        description=(
+            "Optional HF repo for the BPE tokenizer (e.g. 'gpt2'). "
+            "Ignored when tokenizer='word'. Defaults to SmolLM2's "
+            "tokenizer so the first BPE request doesn't force a new "
+            "download. Different names are cached independently."
+        ),
+    )
 
     @model_validator(mode="after")
-    def _tokenizer_requires_neural_model(self) -> "AutocompleteRequest":
+    def _validate_tokenizer_flags(self) -> "AutocompleteRequest":
         if self.tokenizer == "bpe" and self.model not in ("lstm", "transformer"):
             raise ValueError(
                 "tokenizer='bpe' only applies to model='lstm' or 'transformer'"
             )
+        if self.tokenizer_name is not None and self.tokenizer != "bpe":
+            raise ValueError("tokenizer_name requires tokenizer='bpe'")
         return self
 
 
@@ -498,13 +609,16 @@ class BatchRequest(BaseModel):
         pattern="^(ngram|markov|lstm|transformer)$",
     )
     tokenizer: str = Field(default="word", pattern="^(word|bpe)$")
+    tokenizer_name: Optional[str] = Field(default=None, max_length=128)
 
     @model_validator(mode="after")
-    def _tokenizer_requires_neural_model(self) -> "BatchRequest":
+    def _validate_tokenizer_flags(self) -> "BatchRequest":
         if self.tokenizer == "bpe" and self.model not in ("lstm", "transformer"):
             raise ValueError(
                 "tokenizer='bpe' only applies to model='lstm' or 'transformer'"
             )
+        if self.tokenizer_name is not None and self.tokenizer != "bpe":
+            raise ValueError("tokenizer_name requires tokenizer='bpe'")
         return self
 
 
@@ -559,9 +673,15 @@ async def autocomplete(req: AutocompleteRequest):
     if req.model == "markov":
         model = _get_trained_markov()
     elif req.model == "lstm":
-        model = _get_trained_lstm(tokenizer_flavour=req.tokenizer)
+        model = _get_trained_lstm(
+            tokenizer_flavour=req.tokenizer,
+            tokenizer_name=req.tokenizer_name,
+        )
     elif req.model == "transformer":
-        model = _get_trained_transformer(tokenizer_flavour=req.tokenizer)
+        model = _get_trained_transformer(
+            tokenizer_flavour=req.tokenizer,
+            tokenizer_name=req.tokenizer_name,
+        )
     else:
         model = _get_trained_ngram()
 
