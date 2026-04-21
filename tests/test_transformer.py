@@ -115,3 +115,39 @@ class TestTransformerPersistence:
             assert common in model._word_to_id
         for rare in ("d", "rare1", "rare2", "rare3"):
             assert rare not in model._word_to_id
+
+    def test_bpe_fit_save_load_round_trip(self, tmp_path):
+        """BPE-trained transformer: fit on text via tokenizer, save
+        schema-v2 bundle, reload, verify the same top-1 prediction comes
+        back and perplexity is finite on the same text."""
+        from src.bpe_tokenizer import BPETokenizer, HAS_TRANSFORMERS
+        if not HAS_TRANSFORMERS:
+            pytest.skip("transformers not installed")
+
+        tok = BPETokenizer()
+        text = "machine learning is a subset of artificial intelligence " * 8
+
+        original = TransformerModel(
+            d_model=16, n_heads=2, n_layers=1, ff_dim=32, max_seq_len=32,
+        )
+        original.fit(text, epochs=1, seq_len=8, batch_size=2, lr=1e-3, tokenizer=tok)
+        assert original._tokenizer is tok
+        assert original.vocab_size == tok.vocab_size
+
+        path = tmp_path / "xformer_bpe"
+        original.save(str(path))
+        import json
+        meta = json.loads((tmp_path / "xformer_bpe.json").read_text(encoding="utf-8"))
+        assert meta["schema_version"] == 2
+        assert meta["tokenizer"]["type"] == "bpe"
+        assert "vocab" not in meta
+
+        reloaded = TransformerModel.load(str(path))
+        assert reloaded.vocab_size == original.vocab_size
+        assert reloaded._tokenizer is not None
+        assert reloaded.perplexity(text) < float("inf")
+
+        ctx = ["machine", "learning"]
+        orig_top = [w for w, _ in original.predict_next(ctx, top_k=3)]
+        reload_top = [w for w, _ in reloaded.predict_next(ctx, top_k=3)]
+        assert orig_top == reload_top
