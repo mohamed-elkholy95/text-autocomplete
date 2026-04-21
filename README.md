@@ -305,16 +305,16 @@ via `scripts/bench_real_data.py`. No projections.
 
 | Model | Hyperparameters | Fit | Held-out PPL ↓ | Top-1 ↑ | Top-5 ↑ | Diversity ↑ |
 | --- | --- | ---: | ---: | ---: | ---: | ---: |
-| Trigram (n=3, min_freq=2) | Backoff smoothing | 2.8 s | 1643.6 | 5.00 % | 11.00 % | 13.80 % |
-| Markov chain | Laplace, first-order | 0.9 s | 13998.8 | 4.80 % | 12.70 % | 9.60 % |
-| LSTM (stateful, vocab_cap=20k) | embed 128 / hidden 256 / 2 layers, 10 epochs | 30.3 s | 1517.2 | 5.20 % | 14.20 % | 4.10 % |
-| **Transformer** | d_model 128 / 4 heads / 4 layers / ff 512, 5 epochs | **17.2 s** | **1147.4** | **5.40 %** | **18.20 %** | 1.40 % |
+| Trigram (n=3, min_freq=2) | Backoff smoothing | 3.3 s | 1643.6 | 5.00 % | 11.00 % | 13.80 % |
+| Markov chain | Laplace, first-order | 1.1 s | 13998.8 | 4.80 % | 12.70 % | 9.60 % |
+| LSTM (stateful, vocab_cap=20k) | embed 128 / hidden 256 / 2 layers, 10 epochs | 29.5 s | 1537.0 | 4.50 % | 13.00 % | 4.10 % |
+| **Transformer** | d_model 128 / 4 heads / 4 layers / ff 512, 5 epochs | **16.0 s** | **1148.5** | **5.60 %** | **16.90 %** | 1.60 % |
 
 ### Takeaways
 
-- **The transformer wins.** It beats the LSTM on held-out PPL by 24 % and on top-5 by 4.0 pp with half the training time and half the epochs. Top-1 is a statistical tie (5.40 % vs 5.20 %). Attention pays off on WikiText-2 scale.
-- **Both neural models beat the trigram on top-5** (+3.2 pp for the LSTM, +7.2 pp for the transformer) even on word-level tokens.
-- **Diversity is low for both neural rows**, not because the models collapsed but because they're underfit: held-out PPL 1147 vs train PPL 1041 for the transformer is near-zero generalisation gap. More epochs, more params, or subword tokens would push both numbers.
+- **The transformer wins every ranking metric.** 25 % lower held-out PPL than the LSTM (1148 vs 1537), +3.9 pp top-5, +1.1 pp top-1, and it does it in **half the training time and half the epochs**. Attention pays off on WikiText-2 scale.
+- **Both neural models beat the trigram on top-5** (+2.0 pp for the LSTM, +5.9 pp for the transformer) even on word-level tokens.
+- **Diversity is low for both neural rows**, not because the models collapsed but because they're underfit: held-out PPL 1148 vs train PPL 1024 for the transformer is a near-zero generalisation gap. More epochs, more params, or subword tokens would push both numbers.
 
 ### Subword (BPE) path
 
@@ -324,10 +324,20 @@ Measured BPE-trained rows (3 epochs each, `scripts/bench_bpe.py`, SmolLM2 tokeni
 
 | Model | Fit | Held-out PPL ↓ (subword) | Top-1 ↑ | Top-5 ↑ | Diversity ↑ |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| BPE-LSTM | 27.7 s | 2853.9 | 5.00 % | 13.00 % | 6.80 % |
-| **BPE-Transformer** | 25.2 s | 3234.0 | **6.40 %** | **17.60 %** | 3.00 % |
+| BPE-LSTM | 25.6 s | 2861.9 | 5.00 % | 13.80 % | 7.20 % |
+| **BPE-Transformer** | **24.0 s** | **3073.4** | **5.20 %** | **17.80 %** | 3.20 % |
 
-Subword PPL is in units of *subword pieces*, not whole words, so it isn't directly comparable to the word-level PPL column above — don't read "2854 vs 1517" as a regression. Top-k *is* comparable (it just asks "does the right subword appear in the top-k?") and the transformer still wins the ranking metrics (+1.0 pp top-1, +0.3 pp top-5 over its word-level self).
+Subword PPL is in units of *subword pieces*, not whole words, so it isn't directly comparable to the word-level PPL column above — don't read "2862 vs 1537" as a regression. Top-k *is* comparable (it just asks "does the right subword appear in the top-k?") and the transformer still wins the ranking metrics (+0.2 pp top-1, +0.9 pp top-5 over its word-level self; LSTM also gains +0.8 pp top-5 from subwords).
+
+### SLM reference point
+
+`scripts/bench_real_data.py` also loads **SmolLM2-135M** (134.5 M params, bf16 on CUDA) for a side-by-side autocomplete demo. It's a teaching anchor, not a competitor to the project's own models — it has orders of magnitude more parameters and data. On the same hardware:
+
+- Weights load in ~0.7 s from the HF cache.
+- Greedy decode of 12 new tokens: ~390 ms cold, ~90 ms warm.
+- Example output on "Machine learning is a subset of" → `"machine learning. It is a branch of artificial intelligence that uses"`.
+
+The trigram + LSTM + transformer rows above are the things this repo is teaching; the SmolLM2 row is there to keep the scale honest.
 
 ### Reproducing
 
