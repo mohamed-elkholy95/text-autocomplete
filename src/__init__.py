@@ -42,6 +42,7 @@ from src.ngram_model import NGramModel
 from src.markov_model import MarkovChainModel
 from src.neural_model import LSTMModel
 from src.transformer_model import TransformerModel
+from src.bpe_tokenizer import BPETokenizer
 from src.beam_search import BeamSearchDecoder
 from src.data_loader import tokenize, load_sample_data, train_test_split
 from src.evaluation import (
@@ -61,6 +62,7 @@ __all__ = [
     "MarkovChainModel",
     "LSTMModel",
     "TransformerModel",
+    "BPETokenizer",
     "BeamSearchDecoder",
     # Data utilities
     "tokenize",
