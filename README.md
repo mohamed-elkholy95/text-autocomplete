@@ -320,6 +320,15 @@ via `scripts/bench_real_data.py`. No projections.
 
 The project ships a `BPETokenizer` adapter around SmolLM2's ~49 k-piece vocabulary. `LSTMModel.fit` and `TransformerModel.fit` both accept a `tokenizer=` kwarg that swaps the word-level vocab for BPE subwords; checkpoints then save under schema v3 (LSTM) or v2 (Transformer) with the tokenizer identity captured in the JSON meta, and reload into a fully working model. A worked example lives at `scripts/bpe_train_lstm.py`.
 
+Measured BPE-trained rows (3 epochs each, `scripts/bench_bpe.py`, SmolLM2 tokenizer at 49 k subwords):
+
+| Model | Fit | Held-out PPL ↓ (subword) | Top-1 ↑ | Top-5 ↑ | Diversity ↑ |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| BPE-LSTM | 27.7 s | 2853.9 | 5.00 % | 13.00 % | 6.80 % |
+| **BPE-Transformer** | 25.2 s | 3234.0 | **6.40 %** | **17.60 %** | 3.00 % |
+
+Subword PPL is in units of *subword pieces*, not whole words, so it isn't directly comparable to the word-level PPL column above — don't read "2854 vs 1517" as a regression. Top-k *is* comparable (it just asks "does the right subword appear in the top-k?") and the transformer still wins the ranking metrics (+1.0 pp top-1, +0.3 pp top-5 over its word-level self).
+
 ### Reproducing
 
 ```bash
