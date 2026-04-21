@@ -53,8 +53,9 @@ def compute_perplexity(model: Any, tokens: List[str]) -> float:
     from src.ngram_model import NGramModel
     from src.markov_model import MarkovChainModel
     from src.neural_model import LSTMModel
+    from src.transformer_model import TransformerModel
 
-    if isinstance(model, (NGramModel, MarkovChainModel, LSTMModel)):
+    if isinstance(model, (NGramModel, MarkovChainModel, LSTMModel, TransformerModel)):
         return model.perplexity(tokens)
     return float("inf")
 

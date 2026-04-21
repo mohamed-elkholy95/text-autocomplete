@@ -46,6 +46,7 @@ from src.data_loader import (
 from src.ngram_model import NGramModel
 from src.markov_model import MarkovChainModel
 from src.neural_model import LSTMModel, HAS_TORCH
+from src.transformer_model import TransformerModel
 from src.evaluation import (
     compute_perplexity,
     autocomplete_accuracy,
@@ -118,6 +119,29 @@ def cmd_train(args: argparse.Namespace) -> None:
         print(f"✅ LSTM trained in {elapsed:.2f}s")
         print(f"   Vocabulary: {model.vocab_size:,} words")
         print(f"   Params: embed={args.embed_dim}, hidden={args.hidden_dim}, layers={args.num_layers}")
+    elif args.model == "transformer":
+        if not HAS_TORCH:
+            print("❌ Transformer training requires PyTorch. Install it or pick ngram/markov.")
+            sys.exit(1)
+        model = TransformerModel(
+            d_model=args.d_model,
+            n_heads=args.n_heads,
+            n_layers=args.num_layers,
+            ff_dim=args.ff_dim,
+            max_seq_len=args.max_seq_len,
+            vocab_cap=args.vocab_cap,
+        )
+        model.fit(
+            train_tokens,
+            epochs=args.epochs,
+            seq_len=args.seq_len,
+            batch_size=args.batch_size,
+            lr=args.lr,
+        )
+        elapsed = time.perf_counter() - start
+        print(f"✅ Transformer trained in {elapsed:.2f}s")
+        print(f"   Vocabulary: {model.vocab_size:,} words")
+        print(f"   Params: d_model={args.d_model}, heads={args.n_heads}, layers={args.num_layers}, ff={args.ff_dim}")
     else:
         print(f"❌ Unknown model: {args.model}")
         sys.exit(1)
@@ -146,6 +170,11 @@ def cmd_predict(args: argparse.Namespace) -> None:
             model = NGramModel.load(args.load)
         elif args.model == "markov":
             model = MarkovChainModel.load(args.load)
+        elif args.model == "transformer":
+            if not HAS_TORCH:
+                print("❌ Loading a transformer requires PyTorch.")
+                sys.exit(1)
+            model = TransformerModel.load(args.load)
         else:
             if not HAS_TORCH:
                 print("❌ Loading an LSTM requires PyTorch.")
@@ -340,7 +369,7 @@ Examples:
     # --- train subcommand ---
     train_parser = subparsers.add_parser("train", help="Train a language model")
     train_parser.add_argument(
-        "--model", choices=["ngram", "markov", "lstm"], default="ngram",
+        "--model", choices=["ngram", "markov", "lstm", "transformer"], default="ngram",
         help="Model type to train (default: ngram)",
     )
     train_parser.add_argument(
@@ -362,7 +391,11 @@ Examples:
     train_parser.add_argument("--lr", type=float, default=1e-3, help="LSTM: learning rate (default: 1e-3)")
     train_parser.add_argument("--embed-dim", type=int, default=64, help="LSTM: embedding dim (default: 64)")
     train_parser.add_argument("--hidden-dim", type=int, default=128, help="LSTM: hidden dim (default: 128)")
-    train_parser.add_argument("--num-layers", type=int, default=2, help="LSTM: number of layers (default: 2)")
+    train_parser.add_argument("--num-layers", type=int, default=2, help="LSTM/transformer: number of layers (default: 2)")
+    train_parser.add_argument("--d-model", type=int, default=128, help="Transformer: model dim (default: 128)")
+    train_parser.add_argument("--n-heads", type=int, default=4, help="Transformer: attention heads (default: 4)")
+    train_parser.add_argument("--ff-dim", type=int, default=512, help="Transformer: feed-forward dim (default: 512)")
+    train_parser.add_argument("--max-seq-len", type=int, default=256, help="Transformer: max sequence length (default: 256)")
     train_parser.add_argument(
         "--vocab-cap", type=int, default=None,
         help="LSTM: cap vocab at top-N most frequent tokens; rest map to <unk>. "
@@ -389,7 +422,7 @@ Examples:
         help="Input text to complete",
     )
     pred_parser.add_argument(
-        "--model", choices=["ngram", "markov", "lstm"], default="ngram",
+        "--model", choices=["ngram", "markov", "lstm", "transformer"], default="ngram",
         help="Model type (default: ngram)",
     )
     pred_parser.add_argument(
