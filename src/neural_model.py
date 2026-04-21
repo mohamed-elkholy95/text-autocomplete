@@ -178,6 +178,80 @@ class LSTMModel(nn.Module if HAS_TORCH else object):
     def vocab_size(self) -> int:
         return len(self._word_to_id)
 
+    def perplexity(self, tokens: List[str], seq_len: int = 128) -> float:
+        """Compute perplexity on a token sequence via token-level cross-entropy.
+
+        Mirrors the ``perplexity(tokens) -> float`` contract of
+        :class:`NGramModel` and :class:`MarkovChainModel` so
+        :func:`src.evaluation.compute_perplexity` can dispatch to all
+        three model families uniformly.
+
+        OOV tokens in ``tokens`` are mapped to ``<unk>`` if a ``<unk>``
+        entry exists in the model's vocabulary (i.e. the model was fit
+        in the usual way). That keeps the denominator consistent with
+        the training objective — the model is scored on the same
+        distribution it was trained on.
+
+        Args:
+            tokens: Token sequence to evaluate on.
+            seq_len: BPTT window length for the forward passes. Must be
+                at least 1. Longer windows give the recurrent state
+                more context; the default matches the benchmark driver.
+
+        Returns:
+            Perplexity score (float). Returns ``inf`` when the model is
+            not fitted, torch is unavailable, or the sequence is too
+            short to produce even one step.
+        """
+        if not self._is_fitted or not HAS_TORCH:
+            return float("inf")
+        if not isinstance(self, nn.Module):
+            return float("inf")
+
+        unk_id = self._word_to_id.get(UNK_TOKEN, 0)
+        ids = [self._word_to_id.get(w, unk_id) for w in tokens]
+        if len(ids) < 2:
+            return float("inf")
+
+        device = next(self.parameters()).device
+        was_training = self.training
+        self.eval()
+        # Clamp to the longest window the token stream can actually serve.
+        # The inner range is ``range(0, len(ids) - seq_len - 1, seq_len)``,
+        # so we need ``seq_len <= len(ids) - 2`` to guarantee at least one
+        # iteration — otherwise a short test slice silently skips every
+        # step and PPL would inflate to inf.
+        seq_len = max(min(int(seq_len), len(ids) - 2), 1)
+        total_loss = 0.0
+        total_n = 0
+        try:
+            import math
+            import torch.nn.functional as F
+            with torch.no_grad():
+                for i in range(0, len(ids) - seq_len - 1, seq_len):
+                    x = torch.tensor(
+                        ids[i:i + seq_len], dtype=torch.long, device=device
+                    ).unsqueeze(0)
+                    y = torch.tensor(
+                        ids[i + 1:i + seq_len + 1], dtype=torch.long, device=device
+                    ).unsqueeze(0)
+                    logits = self(x)
+                    loss = F.cross_entropy(
+                        logits.reshape(-1, logits.size(-1)),
+                        y.reshape(-1),
+                        reduction="sum",
+                    )
+                    total_loss += float(loss.item())
+                    total_n += y.numel()
+        finally:
+            if was_training:
+                self.train()
+
+        if total_n == 0:
+            return float("inf")
+        avg = total_loss / total_n
+        return float(math.exp(min(avg, 20)))
+
     def save(self, path: str) -> None:
         """Persist the trained model to a two-file bundle.
 
