@@ -3,7 +3,7 @@
 > Plain-language walkthrough of how the autocomplete system is put together,
 > why each piece exists, and what would change if this were a production service.
 
-The project implements three language models behind a single
+The project implements four language models behind a single
 `predict_next(context, top_k)` interface, composes them with a beam-search
 decoder, and exposes the whole thing through three interchangeable frontends
 (CLI, FastAPI, React 19 SPA). The goal is breadth of technique with a small,
@@ -17,37 +17,41 @@ honest surface area — not a toy, not a pretend ChatGPT.
 ┌────────────────────────────────────────────────────────────────────┐
 │                         Data Pipeline                               │
 │   load_sample_data() / load_corpus_from_file()                      │
-│        → normalize_text() → tokenize() → train_test_split()         │
+│        → normalize_text() → tokenize() / BPE / SentencePiece        │
 └──────────────────────────┬─────────────────────────────────────────┘
                            │ tokens
-          ┌────────────────┼────────────────┐
-          ▼                ▼                ▼
-   ┌────────────┐   ┌─────────────┐   ┌────────────┐
-   │  N-gram    │   │   Markov    │   │    LSTM    │
-   │  Model     │   │   Chain     │   │   Neural   │
-   │            │   │             │   │   Model    │
-   │ Backoff +  │   │  Laplace    │   │  PyTorch   │
-   │ Interpol.  │   │  Smoothing  │   │ (optional) │
-   └─────┬──────┘   └──────┬──────┘   └─────┬──────┘
-         │                 │                │
-         └─────────┬───────┘                │
-                   ▼                        │
-           ┌──────────────┐                 │
-           │  Beam Search │◄────────────────┘
-           │  Decoder     │
-           └──────┬───────┘
-                  │
-    ┌─────────────┼─────────────┐
-    ▼             ▼             ▼
-┌────────┐  ┌──────────┐  ┌──────────┐
-│  CLI   │  │ FastAPI  │  │  React   │
-│ cli.py │  │  REST    │  │ frontend │
-└────────┘  └──────────┘  └──────────┘
+   ┌──────────┬────────────┼────────────┬──────────┐
+   ▼          ▼            ▼            ▼          ▼
+┌────────┐ ┌────────┐ ┌──────────┐ ┌──────────────┐
+│ N-gram │ │ Markov │ │   LSTM   │ │ Transformer  │
+│ Model  │ │ Chain  │ │  Neural  │ │  Decoder-only│
+│        │ │        │ │  (tied   │ │  (tied LM    │
+│Backoff+│ │Laplace │ │ embed+   │ │   head +     │
+│Interp. │ │Smooth. │ │  proj.)  │ │ causal attn) │
+└────┬───┘ └────┬───┘ └─────┬────┘ └──────┬───────┘
+     │         │           │             │
+     └────┬────┘           │             │
+          │       ┌────────┴─────┬───────┘
+          ▼       ▼              ▼
+      ┌──────────────┐      ┌──────────────┐
+      │  Beam Search │      │ /attention   │
+      │  Decoder     │      │ (Transformer)│
+      └──────┬───────┘      └──────────────┘
+             │
+    ┌────────┼────────┐
+    ▼        ▼        ▼
+┌────────┐┌──────────┐┌──────────┐
+│  CLI   ││ FastAPI  ││  React   │
+│ cli.py ││  REST    ││ frontend │
+└────────┘└──────────┘└──────────┘
 ```
 
-All three models implement the same `fit(tokens)` / `predict_next(context, top_k)`
-contract, which is what lets the beam-search decoder, the CLI, the API, and the
-React pages stay model-agnostic.
+All four models implement the same `fit(data, tokenizer=None)` /
+`predict_next(context, top_k)` / `perplexity()` contract, which is what lets
+the beam-search decoder, the CLI, the API, and the React pages stay
+model-agnostic. The LSTM and Transformer additionally accept a
+`BPETokenizer` / `SPTokenizer` for subword vocabularies; the two statistical
+models always run on word-level tokens.
 
 ---
 

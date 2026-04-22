@@ -366,11 +366,13 @@ class TestTokenizerSelector:
         from src.api import main as api_main
         if not api_main._bpe_available():
             return  # covered by the transformers-missing 503 test
-        from src.bpe_tokenizer import BPETokenizer as _Real
 
-        class BadTok(_Real):  # type: ignore[misc]
-            def __init__(self, name: str = "x") -> None:
-                raise RuntimeError(f"simulated HF resolve failure for {name}")
+        # Plain callable stand-in — the API only calls BPETokenizer(name=...)
+        # and expects it to raise or return a tokenizer. Subclassing the real
+        # class and skipping super().__init__ was a CodeQL snag; a function
+        # is simpler and has the exact same observable shape.
+        def BadTok(name: str = "x"):
+            raise RuntimeError(f"simulated HF resolve failure for {name}")
 
         monkeypatch.setattr("src.bpe_tokenizer.BPETokenizer", BadTok)
         for k in list(api_main._model_cache):
