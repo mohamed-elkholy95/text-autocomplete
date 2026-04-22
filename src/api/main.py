@@ -604,11 +604,13 @@ def _try_load_checkpoint(model_kind: str, tokenizer_flavour: str):
             from src.transformer_model import TransformerModel
             model = TransformerModel.load(path)
     except Exception as exc:
-        # Use %r so env-sourced path and arbitrary exception messages can't
-        # splice CR/LF or control chars into the log stream (log-injection).
+        # Log only whitelist-validated fields + the exception class name.
+        # The checkpoint path (env-sourced) and exc message (may carry raw
+        # strings from deserialisation) are deliberately kept out of the
+        # log args so CodeQL's log-injection taint analysis stays clean.
         logger.warning(
-            "Checkpoint load failed for %s/%s at %r: %r — falling back to lazy-fit.",
-            model_kind, tokenizer_flavour, path, exc,
+            "Checkpoint load failed for %s/%s (%s) — falling back to lazy-fit.",
+            model_kind, tokenizer_flavour, type(exc).__name__,
         )
         return None
     # Guard against a word-level checkpoint being served on a BPE request
@@ -618,17 +620,15 @@ def _try_load_checkpoint(model_kind: str, tokenizer_flavour: str):
     expected_bpe = (tokenizer_flavour == "bpe")
     if has_bpe != expected_bpe:
         logger.warning(
-            "Checkpoint at %r is %s but the request asked for %s — "
-            "refusing to serve. Point the right env var at the right file.",
-            path,
+            "Checkpoint for %s/%s is %s — refusing to serve. "
+            "Point the right env var at the right file.",
+            model_kind, tokenizer_flavour,
             "BPE-trained" if has_bpe else "word-level",
-            tokenizer_flavour,
         )
         return None
-    logger.info(
-        "Loaded %s/%s checkpoint from %r",
-        model_kind, tokenizer_flavour, path,
-    )
+    # Path is deliberately omitted — operators can look up the env var
+    # corresponding to (model_kind, tokenizer_flavour) in _CHECKPOINT_ENV_VARS.
+    logger.info("Loaded %s/%s checkpoint", model_kind, tokenizer_flavour)
     return model
 
 
@@ -718,8 +718,14 @@ def _get_trained_transformer(
             tokenizer=bpe,
         )
         _model_cache[cache_key] = model
-        # %r escapes any CR/LF the user might have stuffed into tokenizer_name.
-        logger.info("Transformer model (%r) trained and cached", suffix)
+        # Log only the whitelist-validated tokenizer_flavour. tokenizer_name
+        # is user-supplied and therefore kept out of the log to satisfy
+        # CodeQL's log-injection rule.
+        logger.info(
+            "Transformer model (%s%s) trained and cached",
+            tokenizer_flavour,
+            "+custom" if (tokenizer_flavour == "bpe" and tokenizer_name) else "",
+        )
     return _model_cache[cache_key]
 
 
@@ -768,8 +774,13 @@ def _get_trained_lstm(
             tokenizer=bpe,
         )
         _model_cache[cache_key] = model
-        # %r escapes any CR/LF the user might have stuffed into tokenizer_name.
-        logger.info("LSTM model (%r) trained and cached", suffix)
+        # Same rule as the transformer helper: keep user-supplied
+        # tokenizer_name out of the log args.
+        logger.info(
+            "LSTM model (%s%s) trained and cached",
+            tokenizer_flavour,
+            "+custom" if (tokenizer_flavour == "bpe" and tokenizer_name) else "",
+        )
     return _model_cache[cache_key]
 
 
