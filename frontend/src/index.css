@@ -1,0 +1,102 @@
+@import "tailwindcss";
+
+/* =========================================================================
+   Palette (colours.cafe)
+   -------------------------------------------------------------------------
+   #575A6C slate   — ink / text / borders
+   #B4C540 lime    — accent / success
+   #E0E2D2 bone    — muted surface
+   #3686C9 blue    — primary
+   ========================================================================= */
+@theme {
+  --color-brand-slate: #575A6C;
+  --color-brand-lime:  #B4C540;
+  --color-brand-bone:  #E0E2D2;
+  --color-brand-blue:  #3686C9;
+
+  --radius-sm: 0.25rem;
+  --radius-md: 0.5rem;
+  --radius-lg: 0.75rem;
+  --radius-xl: 1rem;
+}
+
+/* shadcn/ui semantic tokens mapped onto the palette above.
+   `@theme inline` lets the semantic names reference the CSS vars set per
+   theme (light/dark) in the :root / .dark blocks below. */
+@theme inline {
+  --color-background:         var(--background);
+  --color-foreground:         var(--foreground);
+  --color-card:               var(--card);
+  --color-card-foreground:    var(--card-foreground);
+  --color-popover:            var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary:            var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary:          var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted:              var(--muted);
+  --color-muted-foreground:   var(--muted-foreground);
+  --color-accent:             var(--accent);
+  --color-accent-foreground:  var(--accent-foreground);
+  --color-destructive:        var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-border:             var(--border);
+  --color-input:              var(--input);
+  --color-ring:               var(--ring);
+}
+
+:root {
+  --background: #FFFFFF;
+  --foreground: #575A6C;
+  --card: #FFFFFF;
+  --card-foreground: #575A6C;
+  --popover: #FFFFFF;
+  --popover-foreground: #575A6C;
+  --primary: #3686C9;
+  --primary-foreground: #FFFFFF;
+  --secondary: #E0E2D2;
+  --secondary-foreground: #575A6C;
+  --muted: #F1F3E9;
+  --muted-foreground: #575A6C;
+  --accent: #B4C540;
+  --accent-foreground: #2D2F3A;
+  --destructive: #C9464A;
+  --destructive-foreground: #FFFFFF;
+  --border: #D4D7C3;
+  --input: #D4D7C3;
+  --ring: #3686C9;
+}
+
+.dark {
+  --background: #2D2F3A;
+  --foreground: #E0E2D2;
+  --card: #575A6C;
+  --card-foreground: #E0E2D2;
+  --popover: #575A6C;
+  --popover-foreground: #E0E2D2;
+  --primary: #5FA5E0;
+  --primary-foreground: #FFFFFF;
+  --secondary: #6B6E80;
+  --secondary-foreground: #E0E2D2;
+  --muted: #6B6E80;
+  --muted-foreground: #E0E2D2;
+  --accent: #B4C540;
+  --accent-foreground: #2D2F3A;
+  --destructive: #E57176;
+  --destructive-foreground: #FFFFFF;
+  --border: #6B6E80;
+  --input: #6B6E80;
+  --ring: #5FA5E0;
+}
+
+@layer base {
+  * { border-color: var(--color-border); }
+  body {
+    background-color: var(--color-background);
+    color: var(--color-foreground);
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto,
+                 "Helvetica Neue", Arial, sans-serif;
+  }
+}

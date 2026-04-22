@@ -21,7 +21,6 @@ HYPERPARAMETERS vs PARAMETERS:
 
 import logging
 from pathlib import Path
-from typing import Dict
 
 logging.basicConfig(
     level=logging.INFO,
@@ -132,14 +131,3 @@ API_PORT = 8010       # Port number for the FastAPI server
 API_TITLE = "Text Autocomplete API"
 API_VERSION = "2.2.0"  # keep in sync with src.__version__
 
-# ---------------------------------------------------------------------------
-# Streamlit Theme
-# ---------------------------------------------------------------------------
-# Dark theme colors for consistent UI appearance.
-# These are applied to the Streamlit app for a professional look.
-STREAMLIT_THEME: Dict[str, str] = {
-    "primaryColor": "#1f77b4",
-    "backgroundColor": "#0e1117",
-    "secondaryBackgroundColor": "#262730",
-    "textColor": "#ffffff",
-}

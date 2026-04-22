@@ -997,7 +997,7 @@ async def metrics():
     """Get API usage metrics (hand-rolled JSON format).
 
     Returns request counts, rate limit hits, and endpoint-level breakdowns.
-    Useful for quick human inspection and for the Streamlit Metrics page.
+    Useful for quick human inspection and for the React Metrics page.
 
     For a scrape-friendly format, install prometheus-fastapi-instrumentator
     and hit /metrics/prom — that endpoint speaks the Prometheus exposition

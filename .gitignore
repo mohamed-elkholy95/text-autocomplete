@@ -25,3 +25,9 @@ context.local.md
 tasks/
 .claude/
 .envrc
+
+# Frontend (React 19 + Vite)
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+frontend/*.log

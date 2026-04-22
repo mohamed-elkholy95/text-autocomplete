@@ -7,7 +7,7 @@
 [![Python](https://img.shields.io/badge/Python-3.12%2B-3776AB?style=flat-square&logo=python)](https://python.org)
 [![Tests](https://img.shields.io/badge/Tests-196%20passed-success?style=flat-square)](#)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.100%2B-009688?style=flat-square)](https://fastapi.tiangolo.com)
-[![Streamlit](https://img.shields.io/badge/Streamlit-1.36%2B-FF4B4B?style=flat-square)](https://streamlit.io)
+[![React](https://img.shields.io/badge/React-19-61DAFB?style=flat-square&logo=react)](https://react.dev)
 [![License](https://img.shields.io/badge/License-MIT-blue?style=flat-square)](LICENSE)
 [![CodeQL](https://img.shields.io/badge/CodeQL-enabled-0E4F88?style=flat-square&logo=github)](.github/workflows/codeql.yml)
 
@@ -56,23 +56,30 @@ All four models implement the same `fit(tokens)` / `predict_next(context, top_k)
 - **Proxy-aware** — honours `X-Forwarded-For` only when `TRUST_FORWARDED_HEADERS=1` is set, to prevent spoofed-IP bucket minting
 - **Model Caching** — Trained models persist across requests for fast inference
 
-### 📊 Streamlit Dashboard
-- **Overview** — Architecture explanation, model comparison, corpus statistics, Zipf's law
-- **Autocomplete** — Interactive predictions with both models, text generation, beam search demo
-- **Metrics** — Perplexity evaluation, n-gram order impact, prediction analysis, Markov transitions
+### 🎨 React Dashboard (`frontend/`)
+- **Overview** — Corpus stats + four model cards pulled live from `/models`
+- **Autocomplete** — Form hitting `/autocomplete` with model and tokenizer selectors, top-k suggestion table with a probability-bar column
+- **Metrics** — JSON `/metrics` counters, a per-endpoint bar chart, and a preview of the Prometheus `/metrics/prom` exposition
+- Built with **React 19 + Vite 8 + TypeScript + Tailwind CSS v4 + shadcn/ui (`new-york-v4`)**, custom 4-color palette (blue / lime / slate / bone), dark mode included
 
 ## Quick Start
 
 ```bash
 git clone https://github.com/mohamed-elkholy95/text-autocomplete.git
 cd text-autocomplete
-pip install -r requirements.txt          # torch is optional — LSTM falls back to a mock if it's missing
-python -m pytest tests/ -v                # 196 tests across 9 files
 
-# Pick one frontend:
-streamlit run streamlit_app/app.py                              # interactive dashboard
-uvicorn src.api.main:app --host 0.0.0.0 --port 8010 --reload    # REST API
-python cli.py info                                              # command-line
+# Backend
+pip install -r requirements.txt          # torch is optional — LSTM falls back to a mock if it's missing
+python -m pytest tests/ -q               # 212+ tests
+uvicorn src.api.main:app --host 0.0.0.0 --port 8010 --reload    # REST API on :8010
+
+# Frontend (in another terminal)
+cd frontend
+npm install
+npm run dev                              # UI on http://localhost:5173
+
+# CLI
+python cli.py info
 ```
 
 ## CLI Usage
@@ -124,13 +131,14 @@ text-autocomplete/
 │   ├── evaluation.py      # Perplexity, accuracy, diversity, coverage, confidence, compare_models
 │   └── api/
 │       └── main.py        # FastAPI REST API (rate-limited, metrics, model cache)
-├── streamlit_app/
-│   ├── app.py             # Main Streamlit entry point
-│   └── pages/
-│       ├── 1_📊_Overview.py
-│       ├── 2_✍️_Autocomplete.py
-│       └── 3_📈_Metrics.py
-├── tests/                  # 196 tests across 9 files
+├── frontend/               # React 19 + Vite 8 + Tailwind v4 + shadcn/ui
+│   ├── src/
+│   │   ├── App.tsx         # Sidebar + nav layout
+│   │   ├── pages/          # Overview / Autocomplete / Metrics
+│   │   ├── components/ui/  # shadcn components (button, card, table, ...)
+│   │   └── lib/            # typed fetch client + Pydantic-mirror types
+│   └── components.json     # shadcn config (style: new-york-v4)
+├── tests/                  # 212+ tests
 │   ├── test_ngram.py
 │   ├── test_markov.py
 │   ├── test_beam_search.py

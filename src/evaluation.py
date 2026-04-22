@@ -169,7 +169,7 @@ def generate_report(
     """Generate a human-readable evaluation report comparing all models.
 
     The report uses a markdown table format, suitable for rendering in
-    GitHub READMEs, Streamlit dashboards, or Jupyter notebooks.
+    GitHub READMEs or Jupyter notebooks.
 
     Args:
         ngram_ppl: N-gram model perplexity.

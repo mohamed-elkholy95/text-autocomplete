@@ -6,7 +6,7 @@
 The project implements three language models behind a single
 `predict_next(context, top_k)` interface, composes them with a beam-search
 decoder, and exposes the whole thing through three interchangeable frontends
-(CLI, FastAPI, Streamlit). The goal is breadth of technique with a small,
+(CLI, FastAPI, React 19 SPA). The goal is breadth of technique with a small,
 honest surface area — not a toy, not a pretend ChatGPT.
 
 ---
@@ -40,14 +40,14 @@ honest surface area — not a toy, not a pretend ChatGPT.
     ┌─────────────┼─────────────┐
     ▼             ▼             ▼
 ┌────────┐  ┌──────────┐  ┌──────────┐
-│  CLI   │  │ FastAPI  │  │Streamlit │
-│ cli.py │  │  REST    │  │Dashboard │
+│  CLI   │  │ FastAPI  │  │  React   │
+│ cli.py │  │  REST    │  │ frontend │
 └────────┘  └──────────┘  └──────────┘
 ```
 
 All three models implement the same `fit(tokens)` / `predict_next(context, top_k)`
 contract, which is what lets the beam-search decoder, the CLI, the API, and the
-Streamlit pages stay model-agnostic.
+React pages stay model-agnostic.
 
 ---
 
@@ -213,8 +213,8 @@ trained once and cached in a module-level dict so requests don't retrain.
 | Interface         | Technology | Entry point                    |
 | ----------------- | ---------- | ------------------------------ |
 | CLI               | argparse   | `cli.py {train,predict,eval,info}` (train takes `--model {ngram,markov,lstm}`, `--vocab-cap`, `--compile`; `eval --include-lstm` adds a three-way comparison column) |
-| REST API          | FastAPI    | `uvicorn src.api.main:app`     |
-| Interactive app   | Streamlit  | `streamlit run streamlit_app/app.py` |
+| REST API          | FastAPI         | `uvicorn src.api.main:app`                        |
+| Interactive app   | React 19 SPA    | `cd frontend && npm run dev` (proxies `/api` → :8010) |
 
 ---
 
@@ -245,8 +245,8 @@ storage changes. Same for the model cache. See §5 for what breaks at scale.
 
 ### Why absolute imports everywhere?
 `from src.config import ...` works uniformly from the test runner, from
-`uvicorn src.api.main:app`, and from CLI/Streamlit entry points (which
-prepend the project root to `sys.path`). Relative imports would couple to
+`uvicorn src.api.main:app`, and from the CLI entry point (which
+prepends the project root to `sys.path`). Relative imports would couple to
 the runner.
 
 ### Why keep PyTorch optional?
@@ -287,7 +287,7 @@ What this project does *not* do, flagged so nobody is surprised:
   are the better signals on this corpus.
 - **Observability: two endpoints, two audiences.** `/metrics` returns a
   hand-rolled JSON summary — small enough to read in one screen and used
-  by the Streamlit Metrics page. When the optional
+  by the React Metrics page. When the optional
   `prometheus-fastapi-instrumentator` package is installed, `/metrics/prom`
   additionally serves Prometheus text format (counters + latency
   histograms) for Grafana / Alertmanager scrapes. A real deployment would
@@ -331,8 +331,8 @@ text-autocomplete/
 │   ├── evaluation.py        # Perplexity, top-k, diversity, coverage, confidence
 │   └── api/
 │       └── main.py          # FastAPI app, middleware, endpoints
-├── streamlit_app/           # Overview / Autocomplete / Metrics pages
-├── tests/                   # 8 test files, 170 tests
+├── frontend/                # React 19 SPA (Vite + Tailwind v4 + shadcn)
+├── tests/                   # 212+ tests
 ├── cli.py                   # train | predict | eval | info
 ├── docs/
 │   ├── ARCHITECTURE.md      # This file

@@ -1,9 +1,8 @@
-# Core runtime
+# Core runtime (Python backend only — the UI is a separate React 19 app
+# under frontend/; see frontend/README.md).
 fastapi>=0.100.0
 uvicorn>=0.23.0
 pydantic>=2.0.0
-streamlit>=1.36.0
-plotly>=5.15.0
 numpy>=1.24.0
 
 # Test runner
