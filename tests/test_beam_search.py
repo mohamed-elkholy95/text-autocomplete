@@ -129,3 +129,75 @@ class TestBeamSearchEdgeCases:
         decoder = BeamSearchDecoder(beam_width=10, max_length=3)
         results = decoder.search(trained_ngram, ["machine"], steps=2)
         assert len(results) <= 10
+
+
+# ---------------------------------------------------------------------------
+# Beam search across the neural contract (LSTM, Transformer)
+# ---------------------------------------------------------------------------
+# The decoder's contract is "any object with predict_next(context, top_k)";
+# these tests confirm the neural families satisfy it end-to-end. Skipped on
+# minimal installs (no torch) — same pattern as the neural unit tests.
+
+from src.neural_model import HAS_TORCH  # noqa: E402
+
+
+@pytest.fixture
+def trained_lstm():
+    if not HAS_TORCH:
+        pytest.skip("PyTorch not installed")
+    from src.neural_model import LSTMModel
+    tokens = tokenize(load_sample_data())
+    m = LSTMModel(embed_dim=16, hidden_dim=32, num_layers=1)
+    return m.fit(tokens, epochs=1, seq_len=8, batch_size=8, lr=1e-3)
+
+
+@pytest.fixture
+def trained_transformer():
+    if not HAS_TORCH:
+        pytest.skip("PyTorch not installed")
+    from src.transformer_model import TransformerModel
+    tokens = tokenize(load_sample_data())
+    m = TransformerModel(
+        d_model=16, n_heads=2, n_layers=1, ff_dim=32, max_seq_len=16,
+    )
+    return m.fit(tokens, epochs=1, seq_len=8, batch_size=8, lr=1e-3)
+
+
+@pytest.mark.skipif(not HAS_TORCH, reason="PyTorch not installed")
+class TestBeamSearchNeural:
+    """Beam search works the same way on LSTM / Transformer as on n-gram.
+    This catches contract drift — e.g. if a future change to
+    ``predict_next`` returns the wrong tuple shape for neural models."""
+
+    def test_lstm_beam_returns_results(self, trained_lstm):
+        decoder = BeamSearchDecoder(beam_width=3, max_length=3)
+        results = decoder.search(trained_lstm, ["machine", "learning"])
+        assert 0 < len(results) <= 3
+        # BeamSearchDecoder.search returns ONLY the generated continuation,
+        # not the context. Each beam is a dict with tokens / score /
+        # log_prob / length fields.
+        for r in results:
+            assert "tokens" in r and "score" in r and "log_prob" in r
+            assert isinstance(r["score"], float)
+            assert len(r["tokens"]) <= 3
+
+    def test_transformer_beam_returns_results(self, trained_transformer):
+        decoder = BeamSearchDecoder(beam_width=3, max_length=3)
+        results = decoder.search(trained_transformer, ["the", "attention"])
+        assert 0 < len(results) <= 3
+        for r in results:
+            assert len(r["tokens"]) <= 3
+            assert all(isinstance(t, str) for t in r["tokens"])
+
+    def test_neural_greedy_vs_beam_both_run(self, trained_transformer):
+        """Beam-1 is effectively greedy; beam-5 should produce ≥ beam-1's
+        length and usually more hypotheses. Both paths must at least
+        execute without error on the neural contract."""
+        greedy = BeamSearchDecoder(beam_width=1, max_length=3).search(
+            trained_transformer, ["deep"],
+        )
+        wide = BeamSearchDecoder(beam_width=5, max_length=3).search(
+            trained_transformer, ["deep"],
+        )
+        assert len(greedy) >= 1
+        assert len(wide) >= len(greedy)

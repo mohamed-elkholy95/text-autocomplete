@@ -42,7 +42,26 @@ class LSTMModel(nn.Module if HAS_TORCH else object):
         num_layers: int = 2,
         dropout: float = 0.2,
         vocab_cap: Optional[int] = None,
+        input_dropout: float = 0.0,
+        embedding_dropout: float = 0.0,
     ) -> None:
+        """AWD-style regulariser knobs (Merity et al. 2018) live alongside
+        the plain recurrent ``dropout``:
+
+        - ``dropout`` — stock between-layer dropout applied *between* LSTM
+          layers (only when ``num_layers > 1``). This is the nn.LSTM kwarg.
+        - ``input_dropout`` — dropout applied to the embedding output
+          before it enters the LSTM. Same ``p`` every step (classic
+          dropout, not variational — educational middle ground).
+        - ``embedding_dropout`` — row-level dropout applied to the
+          embedding *weights* each training step (AWD-LSTM "embed dropout"):
+          a fraction of vocab rows are zeroed out so the model can't rely
+          on always seeing a token's full embedding.
+
+        All AWD knobs default to 0.0, so the default behaviour is
+        bit-identical to pre-AWD bundles — no schema bump, existing
+        v2/v3 checkpoints keep loading. State-dict layout is unchanged.
+        """
         if HAS_TORCH:
             super().__init__()
             # Defer building the nn layers until fit() knows the real vocab.
@@ -50,6 +69,8 @@ class LSTMModel(nn.Module if HAS_TORCH else object):
             self._hidden_dim = hidden_dim
             self._num_layers = num_layers
             self._dropout = dropout
+            self._input_dropout = input_dropout
+            self._embedding_dropout = embedding_dropout
             if vocab_size > 0:
                 self._build_layers(vocab_size)
 
@@ -98,10 +119,30 @@ class LSTMModel(nn.Module if HAS_TORCH else object):
         """Forward pass. When ``hidden`` is provided, returns
         ``(logits, new_hidden)`` for stateful training; otherwise returns
         ``logits`` only so the existing ``predict_next_lstm`` path keeps
-        its shape."""
+        its shape. AWD-style embedding + input dropout apply only when
+        ``self.training`` is True, so eval is deterministic."""
         if not HAS_TORCH:
             return None
-        emb = self.embedding(x)
+
+        # Embedding dropout: zero out a fraction of the *rows* of the
+        # embedding weight, then look up ids against the masked table.
+        # Same effect as randomly replacing tokens with <unk>, but
+        # continuously differentiable.
+        emb_dropout_p = getattr(self, "_embedding_dropout", 0.0)
+        if self.training and emb_dropout_p > 0.0:
+            mask = self.embedding.weight.new_empty(
+                self.embedding.weight.size(0), 1,
+            ).bernoulli_(1 - emb_dropout_p) / (1 - emb_dropout_p)
+            weighted = self.embedding.weight * mask
+            emb = F.embedding(x, weighted)
+        else:
+            emb = self.embedding(x)
+
+        # Input dropout on the embedded sequence before the LSTM.
+        input_dropout_p = getattr(self, "_input_dropout", 0.0)
+        if self.training and input_dropout_p > 0.0:
+            emb = F.dropout(emb, p=input_dropout_p, training=True)
+
         if hidden is None:
             lstm_out, _ = self.lstm(emb)
             return self.fc(self.proj(lstm_out))

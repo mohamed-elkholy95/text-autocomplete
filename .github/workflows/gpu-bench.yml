@@ -1,0 +1,77 @@
+name: GPU benchmark (self-hosted)
+
+# Runs the WikiText-2 + SmolLM2 benchmark on a self-hosted GPU runner and
+# posts the numbers as a commit status + artifact. Dormant until a runner
+# with the `self-hosted` + `gpu` labels comes online; until then this
+# workflow is a no-op (no GPU runner available -> no job dispatched).
+#
+# Enable by:
+#   1. Spin up a machine with CUDA-capable GPU + the nvidia-container
+#      toolkit.
+#   2. Register it as a GitHub Actions self-hosted runner with labels
+#      `self-hosted,gpu,cuda`.
+#   3. Merge this file — subsequent pushes to main and manual dispatches
+#      will execute on that runner.
+#
+# Kept out of the default `ci.yml` because GitHub's hosted runners don't
+# ship GPUs, and we don't want the main pipeline blocking on optional
+# infra. No untrusted-input usage: every `run:` block uses only
+# repository-controlled paths and commands.
+
+on:
+  workflow_dispatch:  # manual trigger from the Actions tab
+  schedule:
+    - cron: "0 6 * * 1"  # Mondays 06:00 UTC
+  push:
+    branches: [main]
+    paths:
+      - "src/neural_model.py"
+      - "src/transformer_model.py"
+      - "src/bpe_tokenizer.py"
+      - "scripts/bench_real_data.py"
+      - "scripts/bench_bpe.py"
+      - "scripts/bench_full_train.py"
+
+jobs:
+  bench:
+    runs-on: [self-hosted, gpu, cuda]
+    timeout-minutes: 60
+
+    permissions:
+      contents: read
+      actions: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install --pre torch torchvision torchaudio \
+            --index-url https://download.pytorch.org/whl/nightly/cu132
+          pip install transformers safetensors datasets
+
+      - name: Word-level benchmark
+        run: python scripts/bench_real_data.py | tee bench_real_data.log
+
+      - name: Subword benchmark
+        run: python scripts/bench_bpe.py | tee bench_bpe.log
+
+      - name: Upload benchmark logs
+        uses: actions/upload-artifact@v4
+        with:
+          name: gpu-bench-logs
+          path: |
+            bench_real_data.log
+            bench_bpe.log
+          if-no-files-found: error
+          retention-days: 30

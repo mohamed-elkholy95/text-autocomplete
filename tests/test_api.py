@@ -7,6 +7,22 @@ from src.api.main import HAS_PROMETHEUS, HAS_REDIS, app
 client = TestClient(app)
 
 
+@pytest.fixture(autouse=True)
+def _reset_rate_buckets():
+    """Clear the shared in-memory rate-limit bucket between every API test.
+
+    Neural-model calls now cost 4–6 tokens each (see `_model_cost`), so
+    a suite of ~40 tests can easily drain the 30-token bucket for the
+    TestClient's localhost IP. Without this fixture, tests run in
+    isolation but fail collectively with a 429 — order-dependent
+    behaviour that's worse than the fix itself.
+    """
+    from src.api.main import _rate_buckets
+    _rate_buckets.clear()
+    yield
+    _rate_buckets.clear()
+
+
 class TestHealth:
     """Tests for the health check endpoint."""
 

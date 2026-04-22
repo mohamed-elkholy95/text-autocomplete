@@ -55,7 +55,8 @@ All four models implement the same `fit(tokens)` / `predict_next(context, top_k)
 - **Attention Visualisation** — `POST /attention` — transformer only; returns per-layer per-head causal self-attention weights for a short prompt (consumed by the React Attention page)
 - **Metrics (JSON)** — `GET /metrics` — request counts, rate-limit hits, per-endpoint breakdown
 - **Metrics (Prometheus)** — `GET /metrics/prom` — Prometheus exposition format with route-level counters, latency histograms, and a custom `autocomplete_model_hits_total{model, tokenizer}` business counter (opt-in; install `prometheus-fastapi-instrumentator`)
-- **Rate Limiting** — token-bucket per client IP (30 burst, 2/s refill) with bounded-memory eviction; transparently upgrades to a shared Redis counter when `REDIS_URL` is set
+- **Rate Limiting** — token-bucket per client IP (30 burst, 2/s refill) with bounded-memory eviction; transparently upgrades to a shared Redis counter when `REDIS_URL` is set. Per-model quotas: neural calls drain more tokens than statistical calls (`ngram`/`markov` = 1, `lstm` = 4, `transformer` = 6 by default; override via `AUTOCOMPLETE_COST_<MODEL>`).
+- **Eval Summary** — `GET /eval/summary` — perplexity + top-1/5 accuracy for every available model on a deterministic 80/20 split of the sample corpus, cached in-process. Feeds the React Metrics page's accuracy bar chart.
 - **API Key Auth (opt-in)** — set `AUTOCOMPLETE_API_KEY` and every non-public endpoint requires `X-API-Key: <value>`. `/health`, `/docs`, `/redoc`, `/openapi.json` stay open.
 - **CORS** — dev default allows `http://localhost:5173` (Vite). Override with `CORS_ALLOWED_ORIGINS=https://app.example.com,...` or set to `*` to restore the old wildcard.
 - **Proxy-aware** — honours `X-Forwarded-For` only when `TRUST_FORWARDED_HEADERS=1` is set, to prevent spoofed-IP bucket minting

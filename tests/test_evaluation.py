@@ -166,3 +166,41 @@ class TestCompareModels:
     def test_compare_empty_models(self):
         results = compare_models({}, ["a", "b"], ["a"])
         assert results == {}
+
+
+# ---------------------------------------------------------------------------
+# Confidence metric on neural predictions
+# ---------------------------------------------------------------------------
+# prediction_confidence() consumes the generic [(token, prob), ...] tuple
+# that every model in the project returns. These tests confirm the metric
+# actually works when fed real LSTM / Transformer output.
+
+from src.evaluation import prediction_confidence  # noqa: E402
+from src.neural_model import HAS_TORCH  # noqa: E402
+
+
+@pytest.mark.skipif(not HAS_TORCH, reason="PyTorch not installed")
+class TestConfidenceOnNeural:
+    def test_lstm_prediction_confidence(self):
+        from src.neural_model import LSTMModel
+        tokens = tokenize(load_sample_data())
+        model = LSTMModel(embed_dim=16, hidden_dim=32, num_layers=1)
+        model.fit(tokens, epochs=1, seq_len=8, batch_size=8, lr=1e-3)
+        preds = model.predict_next(["machine", "learning"], top_k=5)
+        conf = prediction_confidence(preds)
+        assert 0.0 <= conf["top1_prob"] <= 1.0
+        assert conf["entropy"] >= 0.0
+        assert conf["margin"] >= 0.0
+        assert conf["confidence_level"] in {"high", "medium", "low"}
+
+    def test_transformer_prediction_confidence(self):
+        from src.transformer_model import TransformerModel
+        tokens = tokenize(load_sample_data())
+        model = TransformerModel(
+            d_model=16, n_heads=2, n_layers=1, ff_dim=32, max_seq_len=16,
+        )
+        model.fit(tokens, epochs=1, seq_len=8, batch_size=8, lr=1e-3)
+        preds = model.predict_next(["the", "attention"], top_k=5)
+        conf = prediction_confidence(preds)
+        assert 0.0 <= conf["top1_prob"] <= 1.0
+        assert conf["entropy"] >= 0.0

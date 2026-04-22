@@ -51,4 +51,14 @@ export const api = {
       method: "POST",
       body: JSON.stringify(body),
     }),
+  evalSummary: () =>
+    request<{
+      rows: {
+        model: string
+        perplexity: number
+        top1: number
+        top5: number
+      }[]
+      test_tokens: number
+    }>("/eval/summary"),
 }

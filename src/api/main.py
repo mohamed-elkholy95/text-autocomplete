@@ -177,15 +177,17 @@ RATE_LIMIT_MAX_BUCKETS = 10_000
 _rate_buckets: Dict[str, Dict] = {}
 
 
-async def _check_rate_limit(client_ip: str) -> bool:
+async def _check_rate_limit(client_ip: str, cost: int = 1) -> bool:
     """Dispatch to the Redis limiter if it's connected, else in-memory.
 
+    ``cost`` is the number of bucket tokens this request consumes (see
+    ``_model_cost``). cost=1 matches the pre-cost-aware behaviour.
     Kept async because the Redis path awaits network I/O. The memory
     path is still sync under the hood — we just return its result.
     """
     if _redis_client is not None:
-        return await _check_rate_limit_redis(client_ip)
-    return _check_rate_limit_memory(client_ip)
+        return await _check_rate_limit_redis(client_ip, cost)
+    return _check_rate_limit_memory(client_ip, cost)
 
 
 # Redis key layout: one counter per (IP, window). INCR is atomic, so
@@ -196,8 +198,8 @@ _RATE_LIMIT_WINDOW_SECONDS = 15
 _RATE_LIMIT_WINDOW_BUDGET = 30
 
 
-async def _check_rate_limit_redis(client_ip: str) -> bool:
-    """Fixed-window limiter backed by Redis INCR + EXPIRE.
+async def _check_rate_limit_redis(client_ip: str, cost: int = 1) -> bool:
+    """Fixed-window limiter backed by Redis INCRBY + EXPIRE.
 
     The teaching contrast with the in-memory token bucket: here the state
     lives outside the process, so every uvicorn worker sees the same
@@ -209,8 +211,10 @@ async def _check_rate_limit_redis(client_ip: str) -> bool:
     try:
         window = int(time.time() // _RATE_LIMIT_WINDOW_SECONDS)
         key = f"ratelimit:{client_ip}:{window}"
-        count = await _redis_client.incr(key)
-        if count == 1:
+        # INCRBY is atomic and lets a single request drain `cost` tokens
+        # in one round trip — matches the in-memory bucket's semantics.
+        count = await _redis_client.incrby(key, cost)
+        if count == cost:
             # First hit in this window — set the TTL so the key expires.
             await _redis_client.expire(key, _RATE_LIMIT_WINDOW_SECONDS)
         return count <= _RATE_LIMIT_WINDOW_BUDGET
@@ -219,7 +223,7 @@ async def _check_rate_limit_redis(client_ip: str) -> bool:
         return True
 
 
-def _check_rate_limit_memory(client_ip: str) -> bool:
+def _check_rate_limit_memory(client_ip: str, cost: int = 1) -> bool:
     """Check if a client has remaining rate limit tokens.
 
     Returns True if the request is allowed, False if rate-limited. The
@@ -258,9 +262,10 @@ def _check_rate_limit_memory(client_ip: str) -> bool:
     )
     bucket["last_refill"] = now
 
-    # Consume a token if available
-    if bucket["tokens"] >= 1.0:
-        bucket["tokens"] -= 1.0
+    # Consume `cost` tokens if available (cost=1 matches the prior
+    # per-request behaviour; neural endpoints pass higher values).
+    if bucket["tokens"] >= cost:
+        bucket["tokens"] -= cost
         return True
     return False
 
@@ -271,6 +276,45 @@ def _check_rate_limit_memory(client_ip: str) -> bool:
 TRUST_FORWARDED_HEADERS = os.getenv("TRUST_FORWARDED_HEADERS", "").lower() in (
     "1", "true", "yes",
 )
+
+
+# ---------------------------------------------------------------------------
+# Per-model rate-limit costs
+# ---------------------------------------------------------------------------
+# A single /autocomplete call with model=ngram is pennies of CPU; the same
+# call with model=transformer does a forward pass through a neural net.
+# Charging both one token is under-charging the neural paths — a client
+# that hammers model=transformer can burn far more server resources than
+# a client that hammers model=ngram, despite hitting the same rate limit.
+#
+# Fix: every autocomplete endpoint drains the bucket by `cost` tokens
+# where cost reflects the model's relative work. Cheap models cost 1
+# (the baseline); neural models cost more. Tunable via env vars so
+# operators can match their deployment's actual latency distribution.
+
+_MODEL_COSTS_DEFAULT = {
+    "ngram": 1,
+    "markov": 1,
+    "lstm": 4,
+    "transformer": 6,
+}
+
+
+def _model_cost(model_id: str) -> int:
+    """Return the per-request drain for a given model id.
+
+    Falls back to ``AUTOCOMPLETE_COST_<MODEL>`` env vars so operators can
+    override without a code change (e.g. if they run a larger transformer
+    and want it to cost 10 rather than 6).
+    """
+    base = model_id.rstrip("-bpe")  # aliases cost the same as their base
+    override = os.getenv(f"AUTOCOMPLETE_COST_{base.upper()}")
+    if override:
+        try:
+            return max(1, int(override))
+        except ValueError:
+            pass
+    return _MODEL_COSTS_DEFAULT.get(base, 1)
 
 
 def _resolve_client_ip(request: Request) -> str:
@@ -823,8 +867,30 @@ async def health():
     return {"status": "healthy", "version": API_VERSION}
 
 
+async def _charge_model_cost(request: Request, model_id: str) -> None:
+    """Drain additional bucket tokens for expensive models.
+
+    Middleware already consumed 1 token. If the selected model costs more,
+    top up the drain here so neural calls actually cost more than
+    statistical calls against the same bucket. Raises 429 if the bucket
+    doesn't have the remaining balance.
+    """
+    extra = _model_cost(model_id) - 1
+    if extra <= 0:
+        return
+    client_ip = _resolve_client_ip(request)
+    if not await _check_rate_limit(client_ip, cost=extra):
+        raise HTTPException(
+            status_code=429,
+            detail=(
+                f"Rate limit exceeded — model '{model_id}' costs "
+                f"{extra + 1} tokens per request."
+            ),
+        )
+
+
 @app.post("/autocomplete", response_model=AutocompleteResponse)
-async def autocomplete(req: AutocompleteRequest):
+async def autocomplete(req: AutocompleteRequest, request: Request):
     """Get autocomplete suggestions for a given text.
 
     This is the primary endpoint — it takes text input and returns
@@ -849,6 +915,10 @@ async def autocomplete(req: AutocompleteRequest):
     if not tokens:
         # Empty after tokenization — can't make predictions
         raise HTTPException(status_code=400, detail="Text contains no valid tokens.")
+
+    # Extra rate-limit drain proportional to the model's cost (noop for
+    # cheap models; 429 if the bucket can't cover a neural call).
+    await _charge_model_cost(request, req.model)
 
     # Select the model
     if req.model == "markov":
@@ -953,7 +1023,7 @@ async def attention(req: AttentionRequest):
 
 
 @app.post("/autocomplete/batch", response_model=BatchResponse)
-async def autocomplete_batch(req: BatchRequest):
+async def autocomplete_batch(req: BatchRequest, request: Request):
     """Batch autocomplete — get predictions for multiple texts at once.
 
     BATCH PROCESSING is more efficient than making N individual requests:
@@ -971,6 +1041,22 @@ async def autocomplete_batch(req: BatchRequest):
         BatchResponse with predictions for each input text.
     """
     from src.data_loader import tokenize
+
+    # Batch costs model_cost × len(texts) — neural * 50 on a long batch
+    # should 429 rather than silently doing 50 forward passes.
+    extra_per_req = _model_cost(req.model) - 1
+    if extra_per_req > 0:
+        total_extra = extra_per_req * len(req.texts)
+        client_ip = _resolve_client_ip(request)
+        if not await _check_rate_limit(client_ip, cost=total_extra):
+            raise HTTPException(
+                status_code=429,
+                detail=(
+                    f"Rate limit exceeded — batch of {len(req.texts)} "
+                    f"× model '{req.model}' costs "
+                    f"{total_extra + 1} tokens."
+                ),
+            )
 
     results = []
 
@@ -1061,6 +1147,100 @@ async def list_models():
             ),
         })
     return {"models": catalogue}
+
+
+class EvalSummaryRow(BaseModel):
+    """One row of the /eval/summary response — per-model held-out metrics
+    on a fixed split of the built-in sample corpus."""
+    model: str
+    perplexity: float
+    top1: float
+    top5: float
+
+
+class EvalSummaryResponse(BaseModel):
+    """Held-out accuracy + perplexity for every available model, run on
+    the same deterministic split so the numbers are comparable."""
+    rows: List[EvalSummaryRow]
+    test_tokens: int
+
+
+@app.get("/eval/summary", response_model=EvalSummaryResponse)
+async def eval_summary():
+    """Run a fast side-by-side evaluation on the sample corpus.
+
+    The React Metrics page renders this as a bar chart so you can
+    eyeball "which model is best on the teaching corpus today?" without
+    leaving the UI. Numbers are cached in-process until the model cache
+    is rebuilt — re-fitting every request on the 40-sentence corpus
+    would just churn CPU for no benefit.
+    """
+    from src.data_loader import load_sample_data, tokenize, train_test_split
+    from src.evaluation import (
+        compute_perplexity,
+        autocomplete_accuracy,
+    )
+
+    cache_key = "eval:summary:v1"
+    if cache_key in _model_cache:
+        return _model_cache[cache_key]
+
+    tokens = tokenize(load_sample_data())
+    train, test = train_test_split(tokens, test_ratio=0.2, seed=42)
+
+    # Slide a small window over the test split for top-k scoring so every
+    # model gets exactly the same probes.
+    ctx_len = 3
+    probes = [
+        (test[i - ctx_len:i], test[i])
+        for i in range(ctx_len, min(len(test), ctx_len + 200))
+    ]
+
+    rows: List[EvalSummaryRow] = []
+
+    # autocomplete_accuracy wants pred WORDS (not (word, prob) tuples).
+    def _score(m) -> tuple[float, float, float]:
+        preds = [
+            [w for w, _ in m.predict_next(list(ctx), top_k=5)]
+            for ctx, _ in probes
+        ]
+        truths = [t for _, t in probes]
+        return (
+            float(compute_perplexity(m, test)),
+            float(autocomplete_accuracy(preds, truths, top_k=1)),
+            float(autocomplete_accuracy(preds, truths, top_k=5)),
+        )
+
+    for model_id, getter in (
+        ("ngram", _get_trained_ngram),
+        ("markov", _get_trained_markov),
+    ):
+        ppl, t1, t5 = _score(getter())
+        rows.append(EvalSummaryRow(
+            model=model_id, perplexity=ppl, top1=t1, top5=t5,
+        ))
+
+    if _lstm_available():
+        try:
+            ppl, t1, t5 = _score(_get_trained_lstm())
+            rows.append(EvalSummaryRow(
+                model="lstm", perplexity=ppl, top1=t1, top5=t5,
+            ))
+        except HTTPException:
+            pass
+
+    if _transformer_available():
+        try:
+            ppl, t1, t5 = _score(_get_trained_transformer())
+            rows.append(EvalSummaryRow(
+                model="transformer", perplexity=ppl, top1=t1, top5=t5,
+            ))
+        except HTTPException:
+            pass
+
+    resp = EvalSummaryResponse(rows=rows, test_tokens=len(test))
+    _model_cache[cache_key] = resp
+    return resp
 
 
 class GenerateRequest(BaseModel):

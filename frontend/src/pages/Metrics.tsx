@@ -24,9 +24,17 @@ import type { JsonMetrics } from "@/lib/types"
 
 /** Metrics page — JSON /metrics, a per-endpoint bar chart, and a preview
  *  of the Prometheus /metrics/prom scrape endpoint. */
+interface EvalRow {
+  model: string
+  perplexity: number
+  top1: number
+  top5: number
+}
+
 export default function Metrics() {
   const [metrics, setMetrics] = useState<JsonMetrics | null>(null)
   const [prom, setProm] = useState<string | null>(null)
+  const [evalRows, setEvalRows] = useState<EvalRow[] | null>(null)
   const [err, setErr] = useState<string | null>(null)
   const [pending, startTransition] = useTransition()
 
@@ -34,9 +42,14 @@ export default function Metrics() {
     startTransition(() => {
       void (async () => {
         try {
-          const [m, p] = await Promise.all([api.metrics(), api.metricsProm()])
+          const [m, p, evalResp] = await Promise.all([
+            api.metrics(),
+            api.metricsProm(),
+            api.evalSummary(),
+          ])
           setMetrics(m)
           setProm(p)
+          setEvalRows(evalResp.rows)
           setErr(null)
         } catch (e) {
           const msg = (e as Error).message
@@ -138,6 +151,54 @@ export default function Metrics() {
                   fill="var(--primary)"
                   radius={[4, 4, 0, 0]}
                 />
+              </BarChart>
+            </ResponsiveContainer>
+          )}
+        </CardContent>
+      </Card>
+
+      <Card>
+        <CardHeader>
+          <CardTitle>Held-out top-5 accuracy</CardTitle>
+          <CardDescription>
+            Live from <code className="text-xs">/eval/summary</code> — all
+            available models evaluated on the same deterministic 80/20
+            split of the sample corpus. Higher is better.
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="h-72">
+          {!evalRows ? (
+            <Skeleton className="h-full w-full" />
+          ) : (
+            <ResponsiveContainer width="100%" height="100%">
+              <BarChart
+                data={evalRows.map((r) => ({
+                  model: r.model,
+                  "top-1": r.top1,
+                  "top-5": r.top5,
+                }))}
+              >
+                <CartesianGrid strokeDasharray="3 3" stroke="var(--border)" />
+                <XAxis dataKey="model" stroke="var(--foreground)" fontSize={12} />
+                <YAxis
+                  stroke="var(--foreground)"
+                  fontSize={12}
+                  tickFormatter={(v) => `${(v * 100).toFixed(0)}%`}
+                  domain={[0, 1]}
+                />
+                <Tooltip
+                  formatter={(v) =>
+                    typeof v === "number" ? `${(v * 100).toFixed(1)}%` : String(v)
+                  }
+                  contentStyle={{
+                    background: "var(--card)",
+                    border: "1px solid var(--border)",
+                    borderRadius: 6,
+                    color: "var(--foreground)",
+                  }}
+                />
+                <Bar dataKey="top-1" fill="var(--primary)" radius={[4, 4, 0, 0]} />
+                <Bar dataKey="top-5" fill="var(--accent)" radius={[4, 4, 0, 0]} />
               </BarChart>
             </ResponsiveContainer>
           )}
