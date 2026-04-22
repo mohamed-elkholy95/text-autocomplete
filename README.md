@@ -5,9 +5,10 @@
 **N-gram, Markov Chain & Beam Search language models** for text completion with perplexity evaluation
 
 [![Python](https://img.shields.io/badge/Python-3.12%2B-3776AB?style=flat-square&logo=python)](https://python.org)
-[![Tests](https://img.shields.io/badge/Tests-196%20passed-success?style=flat-square)](#)
+[![Tests](https://img.shields.io/badge/Tests-212%20passed-success?style=flat-square)](#)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.100%2B-009688?style=flat-square)](https://fastapi.tiangolo.com)
 [![React](https://img.shields.io/badge/React-19-61DAFB?style=flat-square&logo=react)](https://react.dev)
+[![Tailwind CSS](https://img.shields.io/badge/Tailwind-v4-06B6D4?style=flat-square&logo=tailwindcss)](https://tailwindcss.com)
 [![License](https://img.shields.io/badge/License-MIT-blue?style=flat-square)](LICENSE)
 [![CodeQL](https://img.shields.io/badge/CodeQL-enabled-0E4F88?style=flat-square&logo=github)](.github/workflows/codeql.yml)
 
@@ -51,8 +52,9 @@ All four models implement the same `fit(tokens)` / `predict_next(context, top_k)
 - **Text Generation** — `POST /generate` with temperature control and optional seed for reproducibility
 - **Model Listing** — `GET /models` — discover available models and their parameters
 - **Vocabulary Stats** — `GET /vocab/stats` — corpus and model statistics
-- **Metrics** — `GET /metrics` — request counts, rate-limit hits, per-endpoint breakdown
-- **Rate Limiting** — token-bucket per client IP (30 burst, 2/s refill) with bounded-memory eviction
+- **Metrics (JSON)** — `GET /metrics` — request counts, rate-limit hits, per-endpoint breakdown
+- **Metrics (Prometheus)** — `GET /metrics/prom` — Prometheus exposition format with route-level counters and latency histograms (opt-in; install `prometheus-fastapi-instrumentator`)
+- **Rate Limiting** — token-bucket per client IP (30 burst, 2/s refill) with bounded-memory eviction; transparently upgrades to a shared Redis counter when `REDIS_URL` is set
 - **Proxy-aware** — honours `X-Forwarded-For` only when `TRUST_FORWARDED_HEADERS=1` is set, to prevent spoofed-IP bucket minting
 - **Model Caching** — Trained models persist across requests for fast inference
 
@@ -68,18 +70,114 @@ All four models implement the same `fit(tokens)` / `predict_next(context, top_k)
 git clone https://github.com/mohamed-elkholy95/text-autocomplete.git
 cd text-autocomplete
 
-# Backend
+# --- Backend (Python 3.12+) ---
 pip install -r requirements.txt          # torch is optional — LSTM falls back to a mock if it's missing
-python -m pytest tests/ -q               # 212+ tests
+python -m pytest tests/ -q               # 212 tests, ~5 s
 uvicorn src.api.main:app --host 0.0.0.0 --port 8010 --reload    # REST API on :8010
 
-# Frontend (in another terminal)
-cd frontend
-npm install
-npm run dev                              # UI on http://localhost:5173
+# --- CLI ---
+python cli.py info                       # corpus stats + Zipf-style frequencies
+```
 
-# CLI
-python cli.py info
+For the interactive UI, see the [Web UI](#web-ui) section below.
+
+## Web UI
+
+A **React 19 single-page app** lives under `frontend/`. It's built with
+Vite 8, TypeScript, Tailwind CSS v4, and shadcn/ui (`new-york-v4` style),
+and talks to the FastAPI backend via a `/api` dev proxy. Three pages
+mirror the REST surface:
+
+| Page | Route | What it shows |
+| --- | --- | --- |
+| Overview | `/` | Corpus stats + four model cards pulled live from `GET /models` |
+| Autocomplete | `/autocomplete` | Form hitting `POST /autocomplete` with model + tokenizer selectors, top-k suggestion table with per-row probability bars |
+| Metrics | `/metrics` | JSON `/metrics` counters, a per-endpoint bar chart (Recharts), and a preview of the Prometheus `/metrics/prom` exposition |
+
+Dark mode, a health pill polled from `/health`, and a 4-color brand
+palette (blue `#3686C9`, lime `#B4C540`, slate `#575A6C`, bone `#E0E2D2`)
+ship out of the box.
+
+### Prerequisites
+
+- **Node.js 20+** and **npm 10+** (the project is tested on Node 24 / npm 11).
+  Install via [nvm](https://github.com/nvm-sh/nvm) (`nvm install --lts`) or
+  your package manager — no global dependencies required beyond Node itself.
+- The FastAPI backend from the quick-start above, running on port 8010.
+
+### Run in development
+
+```bash
+# 1. Start the API (in one terminal)
+uvicorn src.api.main:app --host 127.0.0.1 --port 8010 --reload
+
+# 2. Start the UI (in another terminal)
+cd frontend
+npm install                # first time only; installs ~250 MB into frontend/node_modules
+npm run dev                # Vite dev server on http://localhost:5173
+```
+
+Open <http://localhost:5173> in your browser. The dev server hot-reloads
+on save, and its `/api/*` proxy transparently forwards every fetch to
+`http://127.0.0.1:8010`, so the UI and API share the same origin from
+the browser's perspective — no CORS config needed during development.
+
+### Serve pre-trained checkpoints (optional)
+
+Point the four `AUTOCOMPLETE_*_CHECKPOINT_*` env vars at checkpoint
+bundles before starting the API and the neural models load from disk
+instead of lazy-fitting on the sample corpus:
+
+```bash
+export AUTOCOMPLETE_LSTM_CHECKPOINT_WORD=models/lstm_wikitext2_long
+export AUTOCOMPLETE_TRANSFORMER_CHECKPOINT_WORD=models/transformer_wikitext2_long
+export AUTOCOMPLETE_LSTM_CHECKPOINT_BPE=models/lstm_wikitext2_bpe_long
+export AUTOCOMPLETE_TRANSFORMER_CHECKPOINT_BPE=models/transformer_wikitext2_bpe_long
+uvicorn src.api.main:app --host 127.0.0.1 --port 8010
+```
+
+The API's `lifespan` hook pre-loads the checkpoints at startup, so the
+first `/autocomplete` request with `model=lstm` or `model=transformer`
+returns in milliseconds instead of seconds. Generate compatible
+checkpoints with `python scripts/bench_full_train.py` (see
+[Real-Data Benchmarks](#real-data-benchmarks)).
+
+### Build for production
+
+```bash
+cd frontend
+npm run build                 # outputs frontend/dist/ (tree-shaken, minified, ~215 kB gzip)
+npm run preview               # optional: serve the built bundle locally on :4173
+```
+
+`dist/` is a plain static bundle — drop it behind nginx, Caddy, or any
+CDN and point it at an origin that proxies `/api/*` to the FastAPI. For
+the smallest deployment footprint you can also mount `dist/` inside the
+FastAPI app itself via `StaticFiles`; not done by default so the
+educational separation between API and UI stays clear.
+
+### Project layout (frontend/)
+
+```
+frontend/
+├── index.html
+├── package.json
+├── vite.config.ts               # Tailwind v4 plugin, @/ alias, /api dev proxy
+├── tsconfig.json / tsconfig.app.json
+├── components.json              # shadcn config (style: "new-york-v4")
+└── src/
+    ├── main.tsx                 # Router setup
+    ├── App.tsx                  # Sidebar + nav layout, health pill, theme toggle
+    ├── index.css                # Tailwind v4 @theme + shadcn semantic tokens
+    ├── pages/
+    │   ├── Overview.tsx
+    │   ├── Autocomplete.tsx     # uses React 19 useActionState for form submit
+    │   └── Metrics.tsx          # uses React 19 useTransition for refresh
+    ├── components/ui/           # shadcn components (button, card, table, …)
+    └── lib/
+        ├── api.ts               # typed fetch wrappers for every REST endpoint
+        ├── types.ts             # mirrors FastAPI Pydantic models
+        └── utils.ts             # shadcn cn() helper
 ```
 
 ## CLI Usage
@@ -293,7 +391,7 @@ beams = decoder.search(ngram, context_tokens=["machine", "learning"])
 ## Running Tests
 
 ```bash
-# All tests (196 across 9 test files; BPE tests skip without `transformers`)
+# All tests (212 across 9 test files; BPE tests skip without `transformers`)
 python -m pytest tests/ -v
 
 # Specific test file
