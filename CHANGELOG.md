@@ -7,6 +7,7 @@ section below corresponds to a landmark on `main`.
 ## Unreleased
 
 ### Added
+- **Stateful-BPTT bench (`scripts/bench_stateful.py`)** — runs stateless vs stateful LSTM fits back-to-back on WikiText-2 with identical config/seed and prints a markdown delta table. Closes roadmap R10: at hidden 256 / 2 layers / 12 epochs, stateful was +3.5 % *worse* on held-out PPL, so the `stateful=False` default stays.
 - **Lazy-loaded React routes** — Autocomplete, Attention, and Metrics pages are now code-split. Initial page load ships only the Overview bundle + shared chunks (react, radix); Recharts-heavy routes load on demand.
 - **Request-ID middleware** — every response carries `X-Request-ID` (echoed from the request, or freshly minted UUID16). Paired with structured JSON logs (`LOG_FORMAT=json`) for cross-layer request tracing.
 - **Rate-limit hint headers** — every response includes `X-RateLimit-Limit` and `X-RateLimit-Remaining` so clients can back off before hitting 429.
