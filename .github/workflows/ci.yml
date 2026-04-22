@@ -38,3 +38,32 @@ jobs:
 
       - name: Run tests
         run: python -m pytest tests/ -v --tb=short
+
+  typecheck:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install deps + mypy
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install mypy
+
+      # Config lives in mypy.ini. Intentionally permissive — this repo
+      # is educational and leans on runtime guards (HAS_TORCH,
+      # HAS_TRANSFORMERS, HAS_SENTENCEPIECE) that mypy can't reason
+      # about statically. The job catches missing imports, undefined
+      # names, and other real bugs; doesn't try to fully type the API.
+      - name: Type-check
+        run: mypy src/ cli.py

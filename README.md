@@ -27,6 +27,7 @@ All four models implement the same `fit(tokens)` / `predict_next(context, top_k)
 - **LSTM Neural Model** — PyTorch LSTM with weight tying (Press & Wolf 2016), a configurable `vocab_cap` routing rare tokens to `<unk>`, stateful-BPTT option, optional `torch.compile`, and `bfloat16` autocast on CUDA. Schema-v2 checkpoints (word-level) and schema-v3 (subword, tokenizer-backed) both persist as `safetensors`-weights + JSON-metadata bundles.
 - **Decoder-only Transformer** — Causal self-attention with tied LM head, learned absolute positional embeddings, pre-norm blocks, AdamW + cosine LR. Same persistence discipline as the LSTM; own `schema_version` (v1 word-level, v2 subword).
 - **Subword Tokenizer** — Optional `BPETokenizer` wrapper around `transformers.AutoTokenizer` (defaults to SmolLM2's ~49 k-piece vocab). When passed to `LSTMModel.fit` or `TransformerModel.fit`, the model trains on subword ids directly, with the tokenizer identity captured in the saved meta for reproducible reload.
+- **SentencePiece Tokenizer** — Alternative `SPTokenizer` wrapping Google SentencePiece (Unigram or BPE). Unlike the HF adapter, it can **train a fresh tokenizer on the project's own corpus** via `SPTokenizer.train_from_corpus()` — useful for teaching how subword models are fit in the first place. Same `encode`/`decode`/`vocab_size`/`unk_id`/`name` surface as `BPETokenizer`, so it's a drop-in for the neural models' `tokenizer=` kwarg.
 
 ### 🔍 Advanced Decoding
 - **Beam Search** — Multi-hypothesis decoding with length-normalized scoring (`score = log_prob / length^α`), configurable beam width and search depth
@@ -46,7 +47,7 @@ All four models implement the same `fit(tokens)` / `predict_next(context, top_k)
 - **Deterministic Train/Test Split** — seeded split for reproducible evaluation
 
 ### 🚀 API (FastAPI, port 8010)
-- **Health Check** — `GET /health` — for load balancers and uptime monitoring
+- **Health Check** — `GET /health` — for load balancers and uptime monitoring. Response includes a `capabilities` map so operators can confirm which optional paths are active (torch, transformer, BPE, Prometheus, Redis, API-key auth)
 - **Single Autocomplete** — `POST /autocomplete` with model selection: `ngram`, `markov`, `lstm`, `transformer`, plus BPE aliases `lstm-bpe` / `transformer-bpe` (auto-imply `tokenizer=bpe`)
 - **Batch Autocomplete** — `POST /autocomplete/batch` for processing up to 50 texts per call (same catalogue aliases as `/autocomplete`)
 - **Text Generation** — `POST /generate` with temperature control, optional seed, and `model: markov|lstm|transformer` — neural generation samples from the softmax top-20 each step

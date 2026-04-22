@@ -19,6 +19,7 @@ httpx>=0.24.0
 # torch>=2.1.0
 # safetensors>=0.4.0
 # transformers>=4.40.0
+# sentencepiece>=0.2.0    # Alternative to HF BPE — see src/sp_tokenizer.py
 
 # Optional (observability + distributed rate limit). Install these to
 # enable the Prometheus /metrics/prom endpoint and the Redis-backed

@@ -863,8 +863,24 @@ async def health():
     Returns a simple JSON object with status. This is a standard practice:
     load balancers and orchestration systems (Kubernetes, Docker Compose)
     call this endpoint to check if the service is healthy.
+
+    Also reports which optional capabilities are currently active so
+    operators can confirm their env is wired correctly (torch present,
+    Prometheus instrumentator loaded, Redis rate limiter connected, etc.)
+    without digging through logs. All fields are booleans except `version`.
     """
-    return {"status": "healthy", "version": API_VERSION}
+    return {
+        "status": "healthy",
+        "version": API_VERSION,
+        "capabilities": {
+            "torch": _lstm_available(),
+            "transformer": _transformer_available(),
+            "bpe": _bpe_available(),
+            "prometheus": HAS_PROMETHEUS,
+            "redis_connected": _redis_client is not None,
+            "auth_required": bool(os.getenv("AUTOCOMPLETE_API_KEY", "")),
+        },
+    }
 
 
 async def _charge_model_cost(request: Request, model_id: str) -> None:

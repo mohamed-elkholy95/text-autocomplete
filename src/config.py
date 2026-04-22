@@ -19,13 +19,70 @@ HYPERPARAMETERS vs PARAMETERS:
   These are the "knobs and dials" you adjust to improve performance.
 """
 
+import json
 import logging
+import os
 from pathlib import Path
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-)
+
+class _JsonFormatter(logging.Formatter):
+    """One-line JSON log record — suitable for log shippers (Loki,
+    CloudWatch, Datadog). Includes ISO timestamp, level, logger name,
+    the message, and any extra=... kwargs the caller passed.
+    """
+
+    def format(self, record: logging.LogRecord) -> str:
+        payload = {
+            "ts": self.formatTime(record, datefmt="%Y-%m-%dT%H:%M:%S%z"),
+            "level": record.levelname,
+            "logger": record.name,
+            "msg": record.getMessage(),
+        }
+        # Include anything attached via `logger.info("...", extra={...})`
+        # — but suppress the standard LogRecord instance attributes so
+        # the emitted line is just what the caller cares about.
+        _STANDARD = {
+            "name", "msg", "args", "levelname", "levelno", "pathname",
+            "filename", "module", "exc_info", "exc_text", "stack_info",
+            "lineno", "funcName", "created", "msecs", "relativeCreated",
+            "thread", "threadName", "processName", "process", "taskName",
+            "message", "asctime",
+        }
+        for k, v in record.__dict__.items():
+            if k in _STANDARD or k.startswith("_"):
+                continue
+            try:
+                json.dumps(v)
+                payload[k] = v
+            except TypeError:
+                payload[k] = repr(v)
+        if record.exc_info:
+            payload["exc"] = self.formatException(record.exc_info)
+        return json.dumps(payload, ensure_ascii=False)
+
+
+def _configure_logging() -> None:
+    """Plaintext by default; JSON when ``LOG_FORMAT=json``.
+
+    Called once at import. The plaintext format keeps the educational
+    demo readable (`time [LEVEL] logger: message`); JSON kicks in for
+    production deploys so log shippers can parse structured fields.
+    """
+    fmt = os.getenv("LOG_FORMAT", "text").lower()
+    handler = logging.StreamHandler()
+    if fmt == "json":
+        handler.setFormatter(_JsonFormatter())
+    else:
+        handler.setFormatter(logging.Formatter(
+            "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        ))
+    root = logging.getLogger()
+    root.handlers.clear()
+    root.addHandler(handler)
+    root.setLevel(logging.INFO)
+
+
+_configure_logging()
 
 # ---------------------------------------------------------------------------
 # Paths

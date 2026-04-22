@@ -265,3 +265,75 @@ reasons: pickle executes arbitrary code on load (a security risk for
 models downloaded over the network), and JSON is portable and
 debuggable with any text editor.
 - **Code:** `NGramModel.save()` / `load()`
+
+### Prometheus exposition format
+The `/metrics/prom` endpoint serves metrics in Prometheus's text-based
+format: one metric per line as `<name>{<label>=<value>,...} <float>`,
+preceded by `# HELP` and `# TYPE` comments. Prometheus servers scrape
+this endpoint on an interval and store the values in a time-series
+database. Contrast with the hand-rolled JSON `/metrics` which is a
+one-shot counter snapshot readable by humans.
+- **Code:** `src/api/main.py` (optional, needs `prometheus-fastapi-instrumentator`)
+
+### Token bucket vs fixed window (rate limiting)
+Two common rate-limit algorithms. **Token bucket** (in-memory path):
+each client has a bucket that refills at a constant rate; each request
+drains some tokens; empty bucket → 429. Allows short bursts while
+enforcing long-term limits. **Fixed window** (Redis path): count
+requests in discrete time buckets (e.g. 15-second windows); when the
+count exceeds the budget, reject. Simpler to implement atomically with
+INCR/EXPIRE, but allows burstier traffic at window boundaries.
+- **Code:** `src/api/main.py → _check_rate_limit_memory` / `_check_rate_limit_redis`
+
+### Per-model rate-limit cost
+Neural predictions cost more CPU/GPU than n-gram lookups, so charging
+every endpoint the same token rate under-charges the neural paths.
+This project assigns each model a cost (ngram=1, markov=1, lstm=4,
+transformer=6) and drains the bucket accordingly, so a malicious
+client that floods the transformer endpoint hits 429 ~6× sooner than
+one flooding n-gram.
+- **Code:** `src/api/main.py → _model_cost`
+
+### Causal self-attention
+The "causal" variant of multi-head attention used by decoder-only
+transformers. Its mask zeros out the upper-right triangle of the
+attention matrix, so query token *i* can only attend to key tokens
+*0..i* (not *i+1..T*). This is what lets a transformer be trained to
+predict next tokens and sampled autoregressively at inference without
+leaking future information.
+- **Code:** `src/transformer_model.py → forward()` (`torch.triu(...)` mask)
+
+### Attention-visualisation heatmap
+The React `/attention` page renders per-layer, per-head attention
+weight matrices as colour-coded grids so you can see *what the model
+looks at* when predicting each token. Every row sums to 1; near-zero
+columns past the diagonal confirm the causal mask is active.
+- **Code:** `src/transformer_model.py → attention_matrices()`, `frontend/src/pages/Attention.tsx`
+
+### AWD-LSTM dropout variants
+Beyond stock nn.LSTM dropout between layers, the AWD-LSTM recipe
+(Merity et al. 2018) adds: **input dropout** on the embedded sequence
+before the LSTM, **embedding dropout** applied per-row on the
+embedding matrix during training (equivalent to randomly dropping
+tokens to `<unk>` but continuously differentiable), and optional
+**weight dropout** (DropConnect on the recurrent weight matrices; not
+shipped here). This project exposes the first two as opt-in kwargs
+that default to 0.0 so existing checkpoints behave bit-identically.
+- **Code:** `src/neural_model.py → LSTMModel.__init__(input_dropout=..., embedding_dropout=...)`
+
+### SPA dev proxy
+In development, the Vite dev server runs on port 5173 and proxies
+`/api/*` requests to the FastAPI backend on port 8010. From the
+browser's perspective, UI and API share the same origin, so there's
+no CORS preflight handshake in the dev loop. In production the same
+effect is achieved by mounting the built `frontend/dist/` bundle as
+StaticFiles on the FastAPI app itself.
+- **Code:** `frontend/vite.config.ts → server.proxy`, `src/api/main.py → StaticFiles mount`
+
+### `*-bpe` catalogue alias
+A request-level convenience: `model: "transformer-bpe"` in the
+`/autocomplete` body is auto-normalised to
+`model=transformer, tokenizer=bpe` by the Pydantic request model.
+Saves clients from having to set two fields to mean one thing. The
+base model id is still what the cache and metrics see.
+- **Code:** `src/api/main.py → AutocompleteRequest._validate_tokenizer_flags`

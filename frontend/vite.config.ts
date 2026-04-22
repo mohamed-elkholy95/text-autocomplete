@@ -25,4 +25,28 @@ export default defineConfig({
       },
     },
   },
+  build: {
+    // Split the bundle so the main chunk isn't dominated by Recharts
+    // (Metrics page + Attention page only). React core and router go
+    // together; Radix primitives (shadcn's runtime) stay separate.
+    rollupOptions: {
+      output: {
+        manualChunks: (id: string) => {
+          if (id.includes("node_modules/recharts")) return "charts"
+          if (
+            id.includes("node_modules/react-router") ||
+            id.includes("node_modules/react-dom") ||
+            /node_modules\/react\//.test(id)
+          )
+            return "react"
+          if (
+            id.includes("node_modules/radix-ui") ||
+            id.includes("node_modules/@radix-ui")
+          )
+            return "radix"
+          return undefined
+        },
+      },
+    },
+  },
 })
