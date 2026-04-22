@@ -211,15 +211,12 @@ def _score_local(test_tokens: List[str], probes: List[Tuple[List[str], str]]) ->
     from src.ngram_model import NGramModel
     from src.markov_model import MarkovChainModel
     try:
-        from src.neural_model import LSTMModel, HAS_TORCH
+        from src.neural_model import LSTMModel
     except ImportError:
-        HAS_TORCH = False
         LSTMModel = None  # type: ignore
     try:
         from src.transformer_model import TransformerModel
-        has_tf = HAS_TORCH
     except ImportError:
-        has_tf = False
         TransformerModel = None  # type: ignore
     from src.evaluation import compute_perplexity
 
