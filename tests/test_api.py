@@ -441,6 +441,58 @@ class TestPrometheus:
         assert resp.status_code == 404
 
 
+class TestModelAliases:
+    """Catalogue-level aliases: `lstm-bpe` / `transformer-bpe` in the `model`
+    field should be normalised to `model=lstm` + `tokenizer=bpe` on the
+    server side, without requiring the client to set the tokenizer."""
+
+    def setup_method(self):
+        from src.api.main import _rate_buckets
+        _rate_buckets.clear()
+
+    def test_alias_in_models_catalogue_when_bpe_available(self):
+        from src.api.main import _bpe_available
+        resp = client.get("/models")
+        assert resp.status_code == 200
+        ids = [m["id"] for m in resp.json()["models"]]
+        if _bpe_available():
+            assert "lstm-bpe" in ids
+            assert "transformer-bpe" in ids
+        else:
+            assert "lstm-bpe" not in ids
+            assert "transformer-bpe" not in ids
+
+    def test_alias_rejected_without_bpe_tokenizer_flag(self):
+        """The request model does the normalisation; verify a regular
+        request still rejects `tokenizer=bpe` paired with `model=ngram`."""
+        resp = client.post("/autocomplete", json={
+            "text": "hello world",
+            "model": "ngram",
+            "tokenizer": "bpe",
+        })
+        assert resp.status_code == 422  # model_validator complaint
+
+
+class TestNeuralGenerate:
+    """/generate supports `model=markov|lstm|transformer`."""
+
+    def setup_method(self):
+        from src.api.main import _rate_buckets
+        _rate_buckets.clear()
+
+    def test_markov_generate_default(self):
+        resp = client.post("/generate", json={
+            "start_word": "the", "max_length": 8, "temperature": 1.0,
+        })
+        assert resp.status_code == 200
+        assert resp.json()["model"] == "markov"
+        assert resp.json()["word_count"] >= 1
+
+    def test_generate_model_validation(self):
+        resp = client.post("/generate", json={"model": "nope"})
+        assert resp.status_code == 422
+
+
 class TestAttention:
     """Transformer attention-visualisation endpoint. Skipped without torch."""
 

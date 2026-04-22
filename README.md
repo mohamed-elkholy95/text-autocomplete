@@ -47,9 +47,9 @@ All four models implement the same `fit(tokens)` / `predict_next(context, top_k)
 
 ### 🚀 API (FastAPI, port 8010)
 - **Health Check** — `GET /health` — for load balancers and uptime monitoring
-- **Single Autocomplete** — `POST /autocomplete` with model selection (`ngram`/`markov`)
-- **Batch Autocomplete** — `POST /autocomplete/batch` for processing up to 50 texts per call
-- **Text Generation** — `POST /generate` with temperature control and optional seed for reproducibility
+- **Single Autocomplete** — `POST /autocomplete` with model selection: `ngram`, `markov`, `lstm`, `transformer`, plus BPE aliases `lstm-bpe` / `transformer-bpe` (auto-imply `tokenizer=bpe`)
+- **Batch Autocomplete** — `POST /autocomplete/batch` for processing up to 50 texts per call (same catalogue aliases as `/autocomplete`)
+- **Text Generation** — `POST /generate` with temperature control, optional seed, and `model: markov|lstm|transformer` — neural generation samples from the softmax top-20 each step
 - **Model Listing** — `GET /models` — discover available models and their parameters
 - **Vocabulary Stats** — `GET /vocab/stats` — corpus and model statistics
 - **Attention Visualisation** — `POST /attention` — transformer only; returns per-layer per-head causal self-attention weights for a short prompt (consumed by the React Attention page)

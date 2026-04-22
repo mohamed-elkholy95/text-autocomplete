@@ -9,7 +9,13 @@
 
 import type { components } from "./api-schema"
 
-export type ModelId = "ngram" | "markov" | "lstm" | "transformer"
+export type ModelId =
+  | "ngram"
+  | "markov"
+  | "lstm"
+  | "lstm-bpe"
+  | "transformer"
+  | "transformer-bpe"
 export type Tokenizer = "word" | "bpe"
 
 // Pydantic models -> TypeScript aliases. Pulling from the generated

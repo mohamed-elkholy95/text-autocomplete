@@ -77,6 +77,9 @@ export default function Autocomplete() {
           text,
           top_k: topK,
           model,
+          // The backend normalises *-bpe aliases; for explicit bases we
+          // pass the tokenizer the user picked, except for ngram/markov
+          // where only "word" is valid.
           tokenizer:
             model === "ngram" || model === "markov" ? "word" : tokenizer,
         })
@@ -90,7 +93,12 @@ export default function Autocomplete() {
     { status: "idle" },
   )
 
-  const isNeural = model === "lstm" || model === "transformer"
+  const isNeural =
+    model === "lstm" ||
+    model === "transformer" ||
+    model === "lstm-bpe" ||
+    model === "transformer-bpe"
+  const isAliasedBpe = model === "lstm-bpe" || model === "transformer-bpe"
 
   return (
     <div className="space-y-6">
@@ -131,7 +139,16 @@ export default function Autocomplete() {
                     <SelectValue />
                   </SelectTrigger>
                   <SelectContent>
-                    {(["ngram", "markov", "lstm", "transformer"] as ModelId[])
+                    {(
+                      [
+                        "ngram",
+                        "markov",
+                        "lstm",
+                        "lstm-bpe",
+                        "transformer",
+                        "transformer-bpe",
+                      ] as ModelId[]
+                    )
                       .filter((m) => availableModels.includes(m))
                       .map((m) => (
                         <SelectItem key={m} value={m}>
@@ -145,9 +162,9 @@ export default function Autocomplete() {
               <div>
                 <Label>Tokenizer</Label>
                 <Select
-                  value={tokenizer}
+                  value={isAliasedBpe ? "bpe" : tokenizer}
                   onValueChange={(v) => setTokenizer(v as Tokenizer)}
-                  disabled={!isNeural}
+                  disabled={!isNeural || isAliasedBpe}
                 >
                   <SelectTrigger>
                     <SelectValue />

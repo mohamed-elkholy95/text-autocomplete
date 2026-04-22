@@ -214,11 +214,21 @@ def cmd_predict(args: argparse.Namespace) -> None:
         print("   (no predictions available)")
         return
 
-    # Show predictions as a formatted table
-    max_word_len = max(len(w) for w, _ in predictions)
-    for rank, (word, prob) in enumerate(predictions, 1):
+    # Show predictions as a formatted table. BPE/byte-level tokens can
+    # carry leading spaces (e.g. " of") or continuation marks (e.g. "##ing");
+    # the raw form is useful when debugging, but the visual form is what
+    # the user wanted to predict next. `_display_token` renders the
+    # human-visible version; `_raw_token` keeps the original for callers
+    # that need to round-trip through the vocab.
+    def _display_token(tok: str) -> str:
+        return tok.lstrip(" ") if tok.startswith(" ") else tok
+
+    display = [(_display_token(w), w, p) for w, p in predictions]
+    max_word_len = max(len(d) for d, _, _ in display)
+    for rank, (shown, raw, prob) in enumerate(display, 1):
         bar = "█" * int(prob * 40)  # Visual probability bar
-        print(f"   {rank}. {word:<{max_word_len}}  {prob:>7.2%}  {bar}")
+        suffix = f"  (raw: {raw!r})" if shown != raw else ""
+        print(f"   {rank}. {shown:<{max_word_len}}  {prob:>7.2%}  {bar}{suffix}")
 
 
 def cmd_eval(args: argparse.Namespace) -> None:

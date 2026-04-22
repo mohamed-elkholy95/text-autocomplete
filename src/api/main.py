@@ -707,11 +707,13 @@ class AutocompleteRequest(BaseModel):
     )
     model: str = Field(
         default="ngram",
-        pattern="^(ngram|markov|lstm|transformer)$",
+        pattern="^(ngram|markov|lstm|lstm-bpe|transformer|transformer-bpe)$",
         description=(
-            "Language model to use: 'ngram', 'markov', or (when PyTorch "
-            "is installed) 'lstm' / 'transformer'. Selecting a neural "
-            "model on a minimal install returns 503."
+            "Language model to use. Choices: 'ngram', 'markov', 'lstm', "
+            "'transformer' (word-level), and the subword aliases "
+            "'lstm-bpe' / 'transformer-bpe' (equivalent to the base id "
+            "with tokenizer='bpe'). Neural options require PyTorch; "
+            "BPE options also require the 'transformers' package."
         ),
     )
     tokenizer: str = Field(
@@ -721,7 +723,9 @@ class AutocompleteRequest(BaseModel):
             "Tokenizer flavour: 'word' (default) uses the project's "
             "whitespace+regex tokenizer; 'bpe' wires in a byte-level "
             "BPE tokenizer (needs the optional 'transformers' package, "
-            "and only valid with model='lstm' or 'transformer')."
+            "and only valid with model='lstm' or 'transformer'). "
+            "Ignored when model='lstm-bpe' or 'transformer-bpe' — those "
+            "aliases imply BPE already."
         ),
     )
     tokenizer_name: Optional[str] = Field(
@@ -737,6 +741,11 @@ class AutocompleteRequest(BaseModel):
 
     @model_validator(mode="after")
     def _validate_tokenizer_flags(self) -> "AutocompleteRequest":
+        # Catalogue aliases: "*-bpe" means "the base model with tokenizer=bpe".
+        # Normalise here so downstream code only ever sees the base name.
+        if self.model.endswith("-bpe"):
+            self.model = self.model[: -len("-bpe")]
+            self.tokenizer = "bpe"
         if self.tokenizer == "bpe" and self.model not in ("lstm", "transformer"):
             raise ValueError(
                 "tokenizer='bpe' only applies to model='lstm' or 'transformer'"
@@ -775,13 +784,16 @@ class BatchRequest(BaseModel):
     top_k: int = Field(default=5, ge=1, le=20)
     model: str = Field(
         default="ngram",
-        pattern="^(ngram|markov|lstm|transformer)$",
+        pattern="^(ngram|markov|lstm|lstm-bpe|transformer|transformer-bpe)$",
     )
     tokenizer: str = Field(default="word", pattern="^(word|bpe)$")
     tokenizer_name: Optional[str] = Field(default=None, max_length=128)
 
     @model_validator(mode="after")
     def _validate_tokenizer_flags(self) -> "BatchRequest":
+        if self.model.endswith("-bpe"):
+            self.model = self.model[: -len("-bpe")]
+            self.tokenizer = "bpe"
         if self.tokenizer == "bpe" and self.model not in ("lstm", "transformer"):
             raise ValueError(
                 "tokenizer='bpe' only applies to model='lstm' or 'transformer'"
@@ -1030,6 +1042,24 @@ async def list_models():
                 "time. Trained lazily on first request; takes a few seconds."
             ),
         })
+    if _bpe_available():
+        catalogue.append({
+            "id": "lstm-bpe",
+            "name": "LSTM (BPE subwords)",
+            "description": (
+                "Same LSTM architecture but trained on SmolLM2's ~49k "
+                "subword tokenizer instead of whitespace-split words. "
+                "Alias for model='lstm' + tokenizer='bpe'."
+            ),
+        })
+        catalogue.append({
+            "id": "transformer-bpe",
+            "name": "Transformer (BPE subwords)",
+            "description": (
+                "Same transformer architecture but trained on subword "
+                "tokens. Alias for model='transformer' + tokenizer='bpe'."
+            ),
+        })
     return {"models": catalogue}
 
 
@@ -1055,6 +1085,15 @@ class GenerateRequest(BaseModel):
         default=None,
         description="Random seed for reproducible generation.",
     )
+    model: str = Field(
+        default="markov",
+        pattern="^(markov|lstm|transformer)$",
+        description=(
+            "Generator model: 'markov' (default, sampling from transition "
+            "probabilities), or a neural 'lstm' / 'transformer' that "
+            "samples from the softmax each step with the given temperature."
+        ),
+    )
 
 
 class GenerateResponse(BaseModel):
@@ -1065,9 +1104,38 @@ class GenerateResponse(BaseModel):
     model: str = Field(default="markov", description="Model used for generation.")
 
 
+def _neural_generate(neural_model, start_word, max_length, temperature, seed):
+    """Temperature-sampled iterative generation for LSTM / Transformer.
+
+    Each step, we ask the model for top-20 softmax candidates, scale the
+    probabilities by 1/temperature, renormalise, and sample one token.
+    Falls back to the top-1 word if the model returns nothing (e.g. on
+    a minimal install where predict_next returns mock outputs)."""
+    import random
+    rng = random.Random(seed)
+    words = [start_word] if start_word else ["the"]
+    for _ in range(max_length):
+        preds = neural_model.predict_next(words, top_k=20)
+        if not preds:
+            break
+        # Temperature rescale. Low T sharpens, high T flattens.
+        scaled = [(w, p ** (1.0 / max(temperature, 1e-3))) for w, p in preds]
+        total = sum(p for _, p in scaled) or 1.0
+        r = rng.random() * total
+        cum = 0.0
+        pick = preds[0][0]
+        for w, p in scaled:
+            cum += p
+            if r <= cum:
+                pick = w
+                break
+        words.append(pick)
+    return " ".join(words)
+
+
 @app.post("/generate", response_model=GenerateResponse)
 async def generate_text(req: GenerateRequest):
-    """Generate text using the Markov chain model.
+    """Generate text using the selected language model.
 
     TEXT GENERATION is a natural extension of autocomplete — instead of
     predicting ONE next word, we iteratively predict many words to produce
@@ -1078,27 +1146,42 @@ async def generate_text(req: GenerateRequest):
     - 1.0: Natural diversity, balanced between common and rare words
     - 2.0+: Wild and creative, may produce unusual word combinations
 
-    Try it: generate with temperature=0.3 vs temperature=2.0 and compare!
+    Markov generation samples from the transition table directly; neural
+    generation samples from the softmax top-20 each step. Neural
+    generation on a tiny-corpus lazy-fit model tends to produce junk —
+    use a trained checkpoint via AUTOCOMPLETE_*_CHECKPOINT_* for
+    coherent output.
 
     Args:
-        req: GenerateRequest with start_word, max_length, and temperature.
+        req: GenerateRequest with start_word, max_length, temperature, model.
 
     Returns:
         GenerateResponse with the generated text and metadata.
     """
-    model = _get_trained_markov()
-    text = model.generate_text(
-        start_word=req.start_word,
-        max_length=req.max_length,
-        temperature=req.temperature,
-        seed=req.seed,
-    )
+    if req.model == "lstm":
+        model = _get_trained_lstm()
+        text = _neural_generate(
+            model, req.start_word, req.max_length, req.temperature, req.seed,
+        )
+    elif req.model == "transformer":
+        model = _get_trained_transformer()
+        text = _neural_generate(
+            model, req.start_word, req.max_length, req.temperature, req.seed,
+        )
+    else:
+        model = _get_trained_markov()
+        text = model.generate_text(
+            start_word=req.start_word,
+            max_length=req.max_length,
+            temperature=req.temperature,
+            seed=req.seed,
+        )
 
     return GenerateResponse(
         text=text,
         word_count=len(text.split()),
         temperature=req.temperature,
-        model="markov",
+        model=req.model,
     )
 
 
