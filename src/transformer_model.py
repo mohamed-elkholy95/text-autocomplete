@@ -242,6 +242,74 @@ class TransformerModel(nn.Module if HAS_TORCH else object):
             for i, p in zip(topk.indices.tolist(), topk.values.tolist())
         ]
 
+    def attention_matrices(
+        self,
+        context: List[str],
+    ) -> Dict[str, Any]:
+        """Return per-layer, per-head causal self-attention weights.
+
+        Does a manual forward pass that mirrors ``nn.TransformerEncoderLayer``
+        with ``norm_first=True`` but captures each layer's attention matrix.
+        Purpose is visualisation, not production inference — the method is
+        ~O(layers × heads × T²) in memory, which is fine for T ≤ 64.
+
+        Output layout:
+            {
+                "tokens":     [str, ...]  # what each row / col represents
+                "attentions": [            # one entry per layer
+                    [[[float, ...], ...], ...]  # shape [n_heads, T, T]
+                ]
+            }
+        """
+        if not self._is_fitted or not HAS_TORCH:
+            return {"tokens": [], "attentions": []}
+
+        if self._tokenizer is not None:
+            text = " ".join(context) if isinstance(context, list) else str(context)
+            ids = self._tokenizer.encode(text)[-self._max_seq_len:]
+            tokens_out = [self._tokenizer.decode([int(i)]) for i in ids]
+        else:
+            unk_id = self._word_to_id.get(UNK_TOKEN, 0)
+            ids = [self._word_to_id.get(w, unk_id) for w in context][-self._max_seq_len:]
+            tokens_out = [
+                w if w in self._word_to_id else UNK_TOKEN
+                for w in context
+            ][-self._max_seq_len:]
+        if not ids:
+            return {"tokens": [], "attentions": []}
+
+        device = next(self.parameters()).device
+        self.train(False)
+        x = torch.tensor([ids], dtype=torch.long, device=device)
+        b, t = x.shape
+        pos = torch.arange(t, device=device).unsqueeze(0).expand(b, t)
+
+        attentions: List[Any] = []
+        with torch.no_grad():
+            h = self.embedding(x) + self.pos_embedding(pos)
+            mask = torch.triu(
+                torch.ones(t, t, device=device, dtype=torch.bool), diagonal=1,
+            )
+            # Replicate each encoder layer's pre-norm forward but with
+            # need_weights=True on the self-attention call.
+            for layer in self.blocks.layers:
+                normed = layer.norm1(h)
+                attn_out, attn_w = layer.self_attn(
+                    normed, normed, normed,
+                    attn_mask=mask, is_causal=True,
+                    need_weights=True, average_attn_weights=False,
+                )
+                h = h + layer.dropout1(attn_out)
+                ff_in = layer.norm2(h)
+                ff_out = layer.linear2(
+                    layer.dropout(layer.activation(layer.linear1(ff_in))),
+                )
+                h = h + layer.dropout2(ff_out)
+                # attn_w: [batch, n_heads, T, T] — drop batch dim.
+                attentions.append(attn_w[0].cpu().tolist())
+
+        return {"tokens": tokens_out, "attentions": attentions}
+
     def perplexity(self, tokens: List[str], seq_len: int = 128) -> float:
         """Token-level cross-entropy perplexity. OOV through ``<unk>``,
         seq_len clamps to both the test slice length and max_seq_len so

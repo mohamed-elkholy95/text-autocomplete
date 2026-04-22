@@ -1,37 +1,33 @@
-// Mirror of the Pydantic models in src/api/main.py. Keep these in sync
-// by hand — the project is small enough that codegen isn't worth it.
+// Types re-exported from the generated OpenAPI schema so the frontend and
+// FastAPI stay in lockstep. Regenerate with:
+//
+//   # (API must be running on :8010)
+//   npm run gen:api
+//
+// which fetches /openapi.json and writes src/lib/api-schema.d.ts. Do NOT
+// hand-edit api-schema.d.ts — it's regenerated on every run.
+
+import type { components } from "./api-schema"
 
 export type ModelId = "ngram" | "markov" | "lstm" | "transformer"
 export type Tokenizer = "word" | "bpe"
+
+// Pydantic models -> TypeScript aliases. Pulling from the generated
+// schemas keeps every field (including optional ones like tokenizer_name)
+// in sync automatically. Aliases use the names the rest of the app already
+// imports, so this file is the only swap point.
+type S = components["schemas"]
+
+export type AutocompleteRequest = S["AutocompleteRequest"]
+export type AutocompleteResponse = S["AutocompleteResponse"]
+export type Suggestion = S["Suggestion"]
+export type ModelsResponse = { models: ModelInfo[] }
 
 export interface ModelInfo {
   id: ModelId
   name: string
   description: string
   max_ngram_order?: number
-}
-
-export interface ModelsResponse {
-  models: ModelInfo[]
-}
-
-export interface Suggestion {
-  word: string
-  probability: number
-}
-
-export interface AutocompleteRequest {
-  text: string
-  top_k?: number
-  model?: ModelId
-  tokenizer?: Tokenizer
-  tokenizer_name?: string | null
-}
-
-export interface AutocompleteResponse {
-  suggestions: Suggestion[]
-  context: string
-  model: ModelId
 }
 
 export interface HealthResponse {

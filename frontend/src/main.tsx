@@ -4,6 +4,7 @@ import { BrowserRouter, Routes, Route } from "react-router-dom"
 import App from "./App"
 import Overview from "./pages/Overview"
 import Autocomplete from "./pages/Autocomplete"
+import Attention from "./pages/Attention"
 import Metrics from "./pages/Metrics"
 import "./index.css"
 
@@ -16,6 +17,7 @@ createRoot(document.getElementById("root")!).render(
         <Route element={<App />}>
           <Route index element={<Overview />} />
           <Route path="autocomplete" element={<Autocomplete />} />
+          <Route path="attention" element={<Attention />} />
           <Route path="metrics" element={<Metrics />} />
         </Route>
       </Routes>

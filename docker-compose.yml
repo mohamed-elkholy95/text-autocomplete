@@ -1,0 +1,35 @@
+# Local orchestration for the full stack (API + optional Redis).
+# Run with:
+#   docker compose up --build
+#
+# For the CPU-only demo (no neural models), the default service is enough.
+# To enable Redis-backed rate limiting, uncomment the `redis` service and
+# the REDIS_URL env line below.
+
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        # Flip to "1" to bake torch + transformers into the image (~3 GB).
+        # CPU-only; GPU needs the `nvidia` runtime and a CUDA-capable base.
+        INSTALL_TORCH: "0"
+    ports:
+      - "8010:8010"
+    environment:
+      # CORS: include any origin that serves the UI. When served from
+      # the API itself (StaticFiles mount), same-origin makes this moot.
+      CORS_ALLOWED_ORIGINS: "http://localhost:8010"
+      # Uncomment to require `X-API-Key: ...` on every non-/health call.
+      # AUTOCOMPLETE_API_KEY: "change-me"
+      # Uncomment + add the redis service below to share rate-limit state.
+      # REDIS_URL: "redis://redis:6379"
+    restart: unless-stopped
+
+  # Uncomment to run the Redis-backed rate limiter.
+  # redis:
+  #   image: redis:7-alpine
+  #   restart: unless-stopped
+  #   ports:
+  #     - "6379:6379"

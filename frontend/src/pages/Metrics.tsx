@@ -1,4 +1,5 @@
 import { useEffect, useState, useTransition } from "react"
+import { toast } from "sonner"
 import {
   Bar,
   BarChart,
@@ -38,7 +39,9 @@ export default function Metrics() {
           setProm(p)
           setErr(null)
         } catch (e) {
-          setErr((e as Error).message)
+          const msg = (e as Error).message
+          setErr(msg)
+          toast.error("Failed to load metrics", { description: msg })
         }
       })()
     })

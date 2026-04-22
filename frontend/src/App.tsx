@@ -1,8 +1,9 @@
 import { NavLink, Outlet } from "react-router-dom"
 import { useEffect, useState } from "react"
-import { Moon, Sun, Activity, LayoutDashboard, Gauge, Type } from "lucide-react"
+import { Moon, Sun, Activity, LayoutDashboard, Gauge, Type, Grid3x3 } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { Badge } from "@/components/ui/badge"
+import { Toaster } from "@/components/ui/sonner"
 import { api } from "@/lib/api"
 import { cn } from "@/lib/utils"
 
@@ -89,6 +90,7 @@ export default function App() {
         <nav className="flex flex-col gap-1">
           <NavItem to="/" icon={LayoutDashboard} label="Overview" />
           <NavItem to="/autocomplete" icon={Activity} label="Autocomplete" />
+          <NavItem to="/attention" icon={Grid3x3} label="Attention" />
           <NavItem to="/metrics" icon={Gauge} label="Metrics" />
         </nav>
         <div className="mt-auto flex items-center justify-between text-xs text-muted-foreground">
@@ -100,6 +102,8 @@ export default function App() {
       <main className="flex-1 p-8 max-w-5xl mx-auto w-full">
         <Outlet />
       </main>
+
+      <Toaster position="top-right" richColors closeButton />
     </div>
   )
 }

@@ -354,3 +354,79 @@ class TestDataPipeline:
         assert all(len(ng) == 3 for ng in trigrams)
         assert trigrams[0] == (0, 1, 2)
         assert trigrams[-1] == (7, 8, 9)
+
+
+# ---------------------------------------------------------------------------
+# Neural contract integration — transformer + BPE
+# ---------------------------------------------------------------------------
+# Unit tests cover each piece. These tests verify that the pieces fit
+# together across the fit -> predict_next -> save -> load -> predict_next
+# arc, which is the contract the API and CLI assume. Guarded so the suite
+# still passes on minimal installs (no torch, no transformers).
+
+from src.neural_model import HAS_TORCH  # noqa: E402
+from src.bpe_tokenizer import HAS_TRANSFORMERS  # noqa: E402
+
+
+@pytest.mark.skipif(not HAS_TORCH, reason="PyTorch not installed")
+class TestTransformerEnd2End:
+    """Tiny transformer: fit on sample corpus -> save -> reload -> predict."""
+
+    def test_fit_then_predict(self):
+        from src.transformer_model import TransformerModel
+
+        tokens = tokenize(load_sample_data())
+        model = TransformerModel(
+            d_model=32, n_heads=2, n_layers=1, ff_dim=64, max_seq_len=32,
+        )
+        model.fit(tokens, epochs=1, seq_len=8, batch_size=8, lr=1e-3)
+
+        preds = model.predict_next(["machine", "learning"], top_k=5)
+        assert len(preds) == 5
+        assert all(isinstance(w, str) and 0.0 <= p <= 1.0 for w, p in preds)
+
+    def test_save_reload_round_trip(self, tmp_path):
+        from src.transformer_model import TransformerModel
+
+        tokens = tokenize(load_sample_data())
+        a = TransformerModel(
+            d_model=32, n_heads=2, n_layers=1, ff_dim=64, max_seq_len=32,
+        )
+        a.fit(tokens, epochs=1, seq_len=8, batch_size=8, lr=1e-3)
+        before = a.predict_next(["deep", "learning"], top_k=3)
+
+        a.save(str(tmp_path / "xform"))
+        b = TransformerModel.load(str(tmp_path / "xform"))
+        after = b.predict_next(["deep", "learning"], top_k=3)
+
+        # Reloaded model should rank tokens identically.
+        assert [w for w, _ in before] == [w for w, _ in after]
+
+
+@pytest.mark.skipif(
+    not (HAS_TORCH and HAS_TRANSFORMERS),
+    reason="torch + transformers required for BPE path",
+)
+class TestBPEEnd2End:
+    """BPE-driven LSTM: raw text -> fit -> predict -> save -> reload."""
+
+    def test_lstm_bpe_round_trip(self, tmp_path):
+        from src.bpe_tokenizer import BPETokenizer
+        from src.neural_model import LSTMModel
+
+        raw = load_sample_data()
+        tok = BPETokenizer()
+        model = LSTMModel(embed_dim=16, hidden_dim=32, num_layers=1)
+        model.fit(raw, epochs=1, seq_len=8, batch_size=8, lr=1e-3, tokenizer=tok)
+
+        preds = model.predict_next(["deep", "learning"], top_k=5)
+        assert len(preds) > 0
+        assert all(isinstance(w, str) for w, _ in preds)
+
+        model.save(str(tmp_path / "lstm_bpe"))
+        reloaded = LSTMModel.load(str(tmp_path / "lstm_bpe"))
+        # Vocab comes from the BPE tokenizer, not a word list — verify the
+        # loaded model knows that and produces well-typed predictions.
+        assert reloaded.vocab_size == tok.vocab_size
+        re_preds = reloaded.predict_next(["deep", "learning"], top_k=5)
+        assert len(re_preds) > 0

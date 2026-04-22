@@ -1,4 +1,5 @@
 import { useActionState, useEffect, useState } from "react"
+import { toast } from "sonner"
 import {
   Card,
   CardContent,
@@ -66,7 +67,10 @@ export default function Autocomplete() {
   const [state, submit, pending] = useActionState<ActionState, FormData>(
     async (_prev, formData) => {
       const text = (formData.get("text") as string)?.trim() ?? ""
-      if (!text) return { status: "error", error: "Enter some text first." }
+      if (!text) {
+        toast.warning("Enter some text first.")
+        return { status: "error", error: "Enter some text first." }
+      }
       const t0 = performance.now()
       try {
         const data = await api.autocomplete({
@@ -78,7 +82,9 @@ export default function Autocomplete() {
         })
         return { status: "ok", data, tookMs: performance.now() - t0 }
       } catch (e) {
-        return { status: "error", error: (e as Error).message }
+        const msg = (e as Error).message
+        toast.error("Autocomplete failed", { description: msg })
+        return { status: "error", error: msg }
       }
     },
     { status: "idle" },

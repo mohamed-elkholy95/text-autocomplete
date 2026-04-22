@@ -52,9 +52,12 @@ All four models implement the same `fit(tokens)` / `predict_next(context, top_k)
 - **Text Generation** — `POST /generate` with temperature control and optional seed for reproducibility
 - **Model Listing** — `GET /models` — discover available models and their parameters
 - **Vocabulary Stats** — `GET /vocab/stats` — corpus and model statistics
+- **Attention Visualisation** — `POST /attention` — transformer only; returns per-layer per-head causal self-attention weights for a short prompt (consumed by the React Attention page)
 - **Metrics (JSON)** — `GET /metrics` — request counts, rate-limit hits, per-endpoint breakdown
-- **Metrics (Prometheus)** — `GET /metrics/prom` — Prometheus exposition format with route-level counters and latency histograms (opt-in; install `prometheus-fastapi-instrumentator`)
+- **Metrics (Prometheus)** — `GET /metrics/prom` — Prometheus exposition format with route-level counters, latency histograms, and a custom `autocomplete_model_hits_total{model, tokenizer}` business counter (opt-in; install `prometheus-fastapi-instrumentator`)
 - **Rate Limiting** — token-bucket per client IP (30 burst, 2/s refill) with bounded-memory eviction; transparently upgrades to a shared Redis counter when `REDIS_URL` is set
+- **API Key Auth (opt-in)** — set `AUTOCOMPLETE_API_KEY` and every non-public endpoint requires `X-API-Key: <value>`. `/health`, `/docs`, `/redoc`, `/openapi.json` stay open.
+- **CORS** — dev default allows `http://localhost:5173` (Vite). Override with `CORS_ALLOWED_ORIGINS=https://app.example.com,...` or set to `*` to restore the old wildcard.
 - **Proxy-aware** — honours `X-Forwarded-For` only when `TRUST_FORWARDED_HEADERS=1` is set, to prevent spoofed-IP bucket minting
 - **Model Caching** — Trained models persist across requests for fast inference
 
@@ -92,6 +95,7 @@ mirror the REST surface:
 | --- | --- | --- |
 | Overview | `/` | Corpus stats + four model cards pulled live from `GET /models` |
 | Autocomplete | `/autocomplete` | Form hitting `POST /autocomplete` with model + tokenizer selectors, top-k suggestion table with per-row probability bars |
+| Attention | `/attention` | Per-layer, per-head causal self-attention heatmaps from the trained transformer (`POST /attention`) |
 | Metrics | `/metrics` | JSON `/metrics` counters, a per-endpoint bar chart (Recharts), and a preview of the Prometheus `/metrics/prom` exposition |
 
 Dark mode, a health pill polled from `/health`, and a 4-color brand
@@ -146,15 +150,50 @@ checkpoints with `python scripts/bench_full_train.py` (see
 
 ```bash
 cd frontend
-npm run build                 # outputs frontend/dist/ (tree-shaken, minified, ~215 kB gzip)
+npm run build                 # outputs frontend/dist/ (tree-shaken, minified, ~225 kB gzip)
 npm run preview               # optional: serve the built bundle locally on :4173
 ```
 
-`dist/` is a plain static bundle — drop it behind nginx, Caddy, or any
-CDN and point it at an origin that proxies `/api/*` to the FastAPI. For
-the smallest deployment footprint you can also mount `dist/` inside the
-FastAPI app itself via `StaticFiles`; not done by default so the
-educational separation between API and UI stays clear.
+`dist/` is a plain static bundle. Two deployment shapes:
+
+1. **Same process** — `frontend/dist/` is auto-mounted on the FastAPI app
+   when it's present (see `src/api/main.py`). `uvicorn src.api.main:app`
+   then serves both the UI and the API on port 8010.
+2. **Two hosts** — drop `dist/` behind nginx / Caddy / a CDN and point
+   it at an origin that proxies `/api/*` to the FastAPI. Useful if the
+   UI is fronted by a CDN and the API lives in a cluster.
+
+### Docker
+
+A two-stage `Dockerfile` builds the React bundle and bakes it into a
+Python 3.12 image that serves both the API and the SPA on port 8010.
+
+```bash
+docker build -t text-autocomplete .
+docker run --rm -p 8010:8010 text-autocomplete
+# → http://localhost:8010  (UI + /docs + /metrics/prom all on one port)
+```
+
+For the neural paths (LSTM, Transformer, BPE, `/attention`), build with
+`--build-arg INSTALL_TORCH=1` to include torch + transformers (~3 GB
+image). `docker-compose.yml` wires an optional Redis service for the
+shared rate-limit counter; uncomment and set `REDIS_URL` to enable.
+
+### API key auth (opt-in)
+
+Set `AUTOCOMPLETE_API_KEY` to any non-empty string and every non-public
+endpoint will require the header `X-API-Key: <your value>`. Public
+paths (`/health`, `/docs`, `/redoc`, `/openapi.json`) stay open so
+load balancers and the Swagger UI keep working.
+
+```bash
+AUTOCOMPLETE_API_KEY=change-me uvicorn src.api.main:app --host 0.0.0.0 --port 8010
+curl -H "X-API-Key: change-me" http://localhost:8010/models    # 200
+curl http://localhost:8010/models                              # 401
+```
+
+This is the smallest educational surface — a real deployment should use
+OAuth, mTLS, or an API gateway.
 
 ### Project layout (frontend/)
 
@@ -434,6 +473,19 @@ Measured BPE-trained rows (3 epochs each, `scripts/bench_bpe.py`, SmolLM2 tokeni
 | **BPE-Transformer** | **24.0 s** | **3073.4** | **5.20 %** | **17.80 %** | 3.20 % |
 
 Subword PPL is in units of *subword pieces*, not whole words, so it isn't directly comparable to the word-level PPL column above — don't read "2862 vs 1537" as a regression. Top-k *is* comparable (it just asks "does the right subword appear in the top-k?") and the transformer still wins the ranking metrics (+0.2 pp top-1, +0.9 pp top-5 over its word-level self; LSTM also gains +0.8 pp top-5 from subwords).
+
+### Longer training — `scripts/bench_full_train.py`
+
+Scaling configs roughly 2–4× (LSTM embed=256/hidden=512, Transformer d=256/6 layers/ff=1024) and running 25/15 epochs took ~10 min on RTX 5080 and told a clear story: **word-level saturates fast on 2M tokens; BPE benefits the most from extra capacity.**
+
+| Variant | 3–10-ep baseline PPL ↓ | Long-train PPL ↓ | Δ |
+| --- | ---: | ---: | ---: |
+| LSTM / word | 1537.0 (10 ep) | 3335.1 (25 ep) | **+117 %** — overfit |
+| Transformer / word | 1148.5 (5 ep) | 1197.7 (15 ep) | +4 % — saturated |
+| LSTM / BPE (subword) | 2861.9 (3 ep) | **1951.2** (25 ep) | **−32 %** ✓ |
+| Transformer / BPE (subword) | 3073.4 (3 ep) | **1406.2** (15 ep) | **−54 %** ✓ |
+
+Takeaways: more parameters + more epochs aren't universally better — they pay off only where the previous config was under-capacity relative to the data. The word-level LSTM memorised the train set past the point where held-out PPL turns around, and the word-level transformer was already saturating. The BPE path (49k softmax) genuinely needed both the extra capacity and the epoch budget. Checkpoints land at `models/{lstm,transformer}_wikitext2{,_bpe}_long.{safetensors,json}` and can be served by the API via the `AUTOCOMPLETE_*_CHECKPOINT_*` env vars — see the [Web UI](#web-ui) section.
 
 ### SLM reference point
 

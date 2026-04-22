@@ -441,6 +441,67 @@ class TestPrometheus:
         assert resp.status_code == 404
 
 
+class TestAttention:
+    """Transformer attention-visualisation endpoint. Skipped without torch."""
+
+    def setup_method(self):
+        from src.api.main import _rate_buckets
+        _rate_buckets.clear()
+
+    def test_attention_requires_torch(self):
+        from src.api.main import _transformer_available
+        resp = client.post(
+            "/attention",
+            json={"text": "machine learning is", "tokenizer": "word"},
+        )
+        if not _transformer_available():
+            assert resp.status_code == 503
+            return
+        assert resp.status_code == 200
+        data = resp.json()
+        # Structure contract: shape is [layers, heads, seq, seq].
+        assert isinstance(data["tokens"], list) and len(data["tokens"]) > 0
+        assert data["n_layers"] >= 1
+        assert data["n_heads"] >= 1
+        assert data["seq_len"] == len(data["tokens"])
+        mat = data["attentions"][0][0]
+        assert len(mat) == data["seq_len"]
+        assert all(len(row) == data["seq_len"] for row in mat)
+        # Causal mask: first row should attend only to itself.
+        first_row = mat[0]
+        assert first_row[0] == pytest.approx(1.0, abs=1e-4)
+        assert all(v == pytest.approx(0.0, abs=1e-4) for v in first_row[1:])
+
+
+class TestAPIKeyAuth:
+    """Opt-in AUTOCOMPLETE_API_KEY gate on non-public endpoints."""
+
+    def setup_method(self):
+        from src.api.main import _rate_buckets
+        _rate_buckets.clear()
+
+    def test_no_key_set_allows_all(self):
+        # Default path: env var unset → everything works without a key.
+        import os
+        assert not os.getenv("AUTOCOMPLETE_API_KEY")
+        assert client.get("/models").status_code == 200
+
+    def test_protected_path_requires_header(self, monkeypatch):
+        monkeypatch.setenv("AUTOCOMPLETE_API_KEY", "unit-test-key")
+        # /health is public and stays open.
+        assert client.get("/health").status_code == 200
+        # /models is protected.
+        assert client.get("/models").status_code == 401
+        # Wrong key still rejected.
+        assert client.get(
+            "/models", headers={"X-API-Key": "wrong"},
+        ).status_code == 401
+        # Correct key gets through.
+        assert client.get(
+            "/models", headers={"X-API-Key": "unit-test-key"},
+        ).status_code == 200
+
+
 class TestRedisRateLimit:
     """Redis-backed rate limiter (opt-in via REDIS_URL).
 

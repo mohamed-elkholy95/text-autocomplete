@@ -37,6 +37,7 @@ from typing import Annotated, Dict, List, Optional
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, StringConstraints, model_validator
 
 from src.config import API_TITLE, API_VERSION, TOP_K
@@ -300,12 +301,22 @@ def _resolve_client_ip(request: Request) -> str:
 _request_metrics: Dict[str, int] = defaultdict(int)
 
 
-# Enable CORS (Cross-Origin Resource Sharing) so web apps can call this API
-# from a different domain. The wildcard (*) allows all origins — in production,
-# you'd restrict this to your actual frontend domain.
+# CORS (Cross-Origin Resource Sharing).
+# Dev default is the Vite dev server on :5173. Override with a
+# comma-separated env var when deploying, e.g.
+#   CORS_ALLOWED_ORIGINS=https://autocomplete.example.com,https://admin.example.com
+# Set to "*" only if you really want to expose the API to every origin.
+_cors_env = os.getenv(
+    "CORS_ALLOWED_ORIGINS",
+    "http://localhost:5173,http://127.0.0.1:5173",
+).strip()
+CORS_ALLOWED_ORIGINS = (
+    ["*"] if _cors_env == "*"
+    else [o.strip() for o in _cors_env.split(",") if o.strip()]
+)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=CORS_ALLOWED_ORIGINS,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -318,6 +329,19 @@ app.add_middleware(
 # the two don't collide.
 if HAS_PROMETHEUS:
     Instrumentator().instrument(app).expose(app, endpoint="/metrics/prom")
+    # Business-level metric on top of the route-level HTTP counters: one
+    # counter per (model, tokenizer) combination served. Lets a dashboard
+    # answer "how often is transformer-bpe actually used?" without parsing
+    # request bodies. Only defined when the instrumentator is installed
+    # (no registry to attach to otherwise).
+    from prometheus_client import Counter as _PromCounter
+    AUTOCOMPLETE_MODEL_HITS = _PromCounter(
+        "autocomplete_model_hits_total",
+        "Autocomplete predictions served, labeled by model and tokenizer.",
+        ["model", "tokenizer"],
+    )
+else:
+    AUTOCOMPLETE_MODEL_HITS = None
 
 
 @app.middleware("http")
@@ -334,6 +358,19 @@ async def rate_limit_and_metrics_middleware(request: Request, call_next):
     """
     # Extract client IP (honours X-Forwarded-For only when explicitly trusted)
     client_ip = _resolve_client_ip(request)
+
+    # API-key auth (opt-in). Set AUTOCOMPLETE_API_KEY to any non-empty string
+    # and every non-/health request must send `X-API-Key: <that value>`.
+    # Not set: auth is disabled. This is the smallest educational surface —
+    # a real deployment should use OAuth / mTLS / an API gateway.
+    _api_key = os.getenv("AUTOCOMPLETE_API_KEY", "")
+    _public_paths = ("/health", "/docs", "/redoc", "/openapi.json")
+    if _api_key and not request.url.path.startswith(_public_paths):
+        if request.headers.get("x-api-key") != _api_key:
+            return JSONResponse(
+                status_code=401,
+                content={"detail": "Invalid or missing X-API-Key."},
+            )
 
     # Rate limit check (skip health endpoint to allow monitoring)
     if request.url.path != "/health" and not await _check_rate_limit(client_ip):
@@ -823,10 +860,83 @@ async def autocomplete(req: AutocompleteRequest):
     if not preds:
         raise HTTPException(status_code=404, detail="No predictions available for this context.")
 
+    if AUTOCOMPLETE_MODEL_HITS is not None:
+        AUTOCOMPLETE_MODEL_HITS.labels(
+            model=req.model, tokenizer=req.tokenizer,
+        ).inc()
+
     return AutocompleteResponse(
         suggestions=[Suggestion(word=w, probability=round(p, 6)) for w, p in preds],
         context=" ".join(tokens[-5:]),  # Show last 5 words as context
         model=req.model,
+    )
+
+
+class AttentionRequest(BaseModel):
+    """Request body for the transformer attention-visualisation endpoint."""
+    text: str = Field(..., min_length=1, max_length=500)
+    tokenizer: str = Field(default="word", pattern="^(word|bpe)$")
+    tokenizer_name: Optional[str] = Field(default=None, max_length=128)
+
+
+class AttentionResponse(BaseModel):
+    """Per-layer, per-head attention weights on the request tokens."""
+    tokens: List[str] = Field(..., description="Token strings for rows/cols.")
+    attentions: List[List[List[List[float]]]] = Field(
+        ...,
+        description=(
+            "List of per-layer matrices. Each matrix has shape "
+            "[n_heads, seq_len, seq_len]."
+        ),
+    )
+    n_layers: int
+    n_heads: int
+    seq_len: int
+
+
+@app.post("/attention", response_model=AttentionResponse)
+async def attention(req: AttentionRequest):
+    """Return causal self-attention weights for a short text (transformer only).
+
+    Meant for visualisation — the React frontend renders each layer's
+    per-head matrix as a heatmap so you can see "what the model is
+    looking at" at each position. Returns 503 if torch isn't installed.
+    """
+    if not _transformer_available():
+        raise HTTPException(
+            status_code=503,
+            detail="Transformer model unavailable: PyTorch is not installed.",
+        )
+
+    model = _get_trained_transformer(
+        tokenizer_flavour=req.tokenizer,
+        tokenizer_name=req.tokenizer_name,
+    )
+
+    # Word path uses the project's tokenizer; BPE path hands raw text.
+    if req.tokenizer == "word":
+        from src.data_loader import tokenize
+        context = tokenize(req.text)
+    else:
+        context = [req.text]
+
+    if not context:
+        raise HTTPException(status_code=400, detail="Text contains no valid tokens.")
+
+    result = model.attention_matrices(context)
+    attns = result["attentions"]
+    if not attns:
+        raise HTTPException(
+            status_code=404,
+            detail="No attention produced — model is likely unfit.",
+        )
+
+    return AttentionResponse(
+        tokens=result["tokens"],
+        attentions=attns,
+        n_layers=len(attns),
+        n_heads=len(attns[0]),
+        seq_len=len(attns[0][0]),
     )
 
 
@@ -1037,6 +1147,24 @@ async def vocab_stats():
         "markov_vocab_size": _get_trained_markov().vocab_size,
         "available_models": available,
     }
+
+
+# ---------------------------------------------------------------------------
+# Static frontend (optional, production single-process mode)
+# ---------------------------------------------------------------------------
+# If the React app has been built (`cd frontend && npm run build`), mount
+# the resulting `frontend/dist/` at the root so one process serves both
+# the API and the UI. In dev you don't need this — Vite serves the UI
+# and proxies /api/* to FastAPI. The mount is last so every real route
+# above it wins; the StaticFiles `html=True` option serves index.html
+# for any unmatched GET, which is how SPA routing works.
+_FRONTEND_DIST = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+    "frontend", "dist",
+)
+if os.path.isdir(_FRONTEND_DIST):
+    app.mount("/", StaticFiles(directory=_FRONTEND_DIST, html=True), name="spa")
+    logger.info("Mounted built frontend at / from %s", _FRONTEND_DIST)
 
 
 # ---------------------------------------------------------------------------
