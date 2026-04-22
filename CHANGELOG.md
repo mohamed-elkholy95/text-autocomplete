@@ -7,6 +7,8 @@ section below corresponds to a landmark on `main`.
 ## Unreleased
 
 ### Added
+- **Pretrained-HF eval (`scripts/bench_hf_eval.py`)** — loads any `AutoModelForCausalLM` and scores it on a CONTIGUOUS WikiText-2 test split (90/10 character-level cut) with sliding-window perplexity + 300-probe top-1/top-5 next-word accuracy. Outputs markdown; covers local families + HF side-by-side. Writes to `outputs/hf_eval.md`.
+- **XL in-house Transformer (`scripts/bench_train_xl.py`)** — d_model=512 / 8 heads / 12 layers / 20 epochs / seed 42. Produces `models/transformer_wikitext2_xl.{safetensors,json}` (223 MB). Train ~5.8 min on RTX 5080. Held-out PPL 1647.8 on the *shuffled* split — 44 % worse than the d=256/6L baseline (1147 PPL) because training loss saturated at 249 PPL while test stayed at 1647, i.e. the bigger model overfit on the 2 M-token corpus.
 - **Stateful-BPTT bench (`scripts/bench_stateful.py`)** — runs stateless vs stateful LSTM fits back-to-back on WikiText-2 with identical config/seed and prints a markdown delta table. Closes roadmap R10: at hidden 256 / 2 layers / 12 epochs, stateful was +3.5 % *worse* on held-out PPL, so the `stateful=False` default stays.
 - **Lazy-loaded React routes** — Autocomplete, Attention, and Metrics pages are now code-split. Initial page load ships only the Overview bundle + shared chunks (react, radix); Recharts-heavy routes load on demand.
 - **Request-ID middleware** — every response carries `X-Request-ID` (echoed from the request, or freshly minted UUID16). Paired with structured JSON logs (`LOG_FORMAT=json`) for cross-layer request tracing.
