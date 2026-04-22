@@ -457,6 +457,40 @@ class TestPrometheus:
         assert resp.status_code == 404
 
 
+class TestResponseHeaders:
+    """Every response carries a request id, timing, and rate-limit hints."""
+
+    def test_request_id_minted_when_absent(self):
+        resp = client.get("/health")
+        assert resp.status_code == 200
+        rid = resp.headers.get("x-request-id")
+        assert rid and len(rid) >= 8  # minted UUIDs are 16 hex chars
+
+    def test_request_id_echoed_when_client_sends_one(self):
+        resp = client.get(
+            "/health", headers={"X-Request-ID": "client-supplied-abc"},
+        )
+        assert resp.headers.get("x-request-id") == "client-supplied-abc"
+
+    def test_rate_limit_headers_present(self):
+        resp = client.post(
+            "/autocomplete",
+            json={"text": "machine learning", "top_k": 3},
+        )
+        assert resp.status_code == 200
+        assert resp.headers.get("x-ratelimit-limit") == "30"
+        remaining = int(resp.headers.get("x-ratelimit-remaining", "0"))
+        # The test client hit this endpoint; the bucket has less than
+        # the full budget left.
+        assert 0 <= remaining < 30
+
+    def test_response_time_header_present(self):
+        resp = client.get("/health")
+        rt = resp.headers.get("x-response-time-ms")
+        assert rt is not None
+        assert float(rt) >= 0.0
+
+
 class TestModelAliases:
     """Catalogue-level aliases: `lstm-bpe` / `transformer-bpe` in the `model`
     field should be normalised to `model=lstm` + `tokenizer=bpe` on the

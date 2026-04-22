@@ -126,10 +126,33 @@ async def lifespan(app: FastAPI):
 # ---------------------------------------------------------------------------
 # App Initialization
 # ---------------------------------------------------------------------------
+API_TAGS_METADATA = [
+    {
+        "name": "prediction",
+        "description": "Core autocomplete and text-generation endpoints.",
+    },
+    {
+        "name": "evaluation",
+        "description": "Live held-out metrics and attention introspection.",
+    },
+    {
+        "name": "system",
+        "description": "Health, model catalogue, and corpus stats.",
+    },
+    {
+        "name": "observability",
+        "description": (
+            "JSON metrics (/metrics) and the optional Prometheus "
+            "exposition (/metrics/prom)."
+        ),
+    },
+]
+
 app = FastAPI(
     title=API_TITLE,
     version=API_VERSION,
     lifespan=lifespan,
+    openapi_tags=API_TAGS_METADATA,
     description="""
     Text Autocomplete API — Get real-time word completion suggestions.
 
@@ -429,20 +452,44 @@ async def rate_limit_and_metrics_middleware(request: Request, call_next):
     _request_metrics[f"requests:{request.url.path}"] += 1
     _request_metrics["total_requests"] += 1
 
+    # Request ID: echo what the client sent, mint a UUID otherwise.
+    # Ends up in every log line so you can grep a single request's
+    # journey across the timing, rate-limit, and error logs.
+    import uuid
+    req_id = request.headers.get("x-request-id") or uuid.uuid4().hex[:16]
+
+    # Stash on request.state so endpoint handlers can include it in
+    # their own log lines.
+    request.state.request_id = req_id
+
     # Time the request
     start_time = time.perf_counter()
     response = await call_next(request)
     duration_ms = (time.perf_counter() - start_time) * 1000
 
-    # Stamp the timing header first so the logged line reflects what the
-    # client will actually see (matches the order described in
-    # docs/ARCHITECTURE.md §2 step 8).
+    # Stamp the timing + request-id headers first so the logged line
+    # reflects what the client will actually see (matches the order
+    # described in docs/ARCHITECTURE.md §2 step 8).
     response.headers["X-Response-Time-Ms"] = f"{duration_ms:.1f}"
+    response.headers["X-Request-ID"] = req_id
+    # Rate-limit hints: clients can back off before hitting 429.
+    response.headers["X-RateLimit-Limit"] = str(RATE_LIMIT_MAX_TOKENS)
+    bucket = _rate_buckets.get(client_ip)
+    if bucket is not None:
+        response.headers["X-RateLimit-Remaining"] = str(int(bucket["tokens"]))
 
     logger.info(
-        "request: method=%s path=%s status=%d duration=%.1fms client=%s",
-        request.method, request.url.path, response.status_code,
+        "request: id=%s method=%s path=%s status=%d duration=%.1fms client=%s",
+        req_id, request.method, request.url.path, response.status_code,
         duration_ms, client_ip,
+        extra={
+            "request_id": req_id,
+            "http_method": request.method,
+            "http_path": request.url.path,
+            "http_status": response.status_code,
+            "duration_ms": round(duration_ms, 2),
+            "client_ip": client_ip,
+        },
     )
     return response
 
@@ -856,7 +903,7 @@ class BatchResponse(BaseModel):
 # API Endpoints
 # ---------------------------------------------------------------------------
 
-@app.get("/health")
+@app.get("/health", tags=["system"])
 async def health():
     """Health check endpoint — used by monitoring systems to verify the API is running.
 
@@ -905,7 +952,7 @@ async def _charge_model_cost(request: Request, model_id: str) -> None:
         )
 
 
-@app.post("/autocomplete", response_model=AutocompleteResponse)
+@app.post("/autocomplete", response_model=AutocompleteResponse, tags=["prediction"])
 async def autocomplete(req: AutocompleteRequest, request: Request):
     """Get autocomplete suggestions for a given text.
 
@@ -992,7 +1039,7 @@ class AttentionResponse(BaseModel):
     seq_len: int
 
 
-@app.post("/attention", response_model=AttentionResponse)
+@app.post("/attention", response_model=AttentionResponse, tags=["prediction"])
 async def attention(req: AttentionRequest):
     """Return causal self-attention weights for a short text (transformer only).
 
@@ -1038,7 +1085,7 @@ async def attention(req: AttentionRequest):
     )
 
 
-@app.post("/autocomplete/batch", response_model=BatchResponse)
+@app.post("/autocomplete/batch", response_model=BatchResponse, tags=["prediction"])
 async def autocomplete_batch(req: BatchRequest, request: Request):
     """Batch autocomplete — get predictions for multiple texts at once.
 
@@ -1104,7 +1151,7 @@ async def autocomplete_batch(req: BatchRequest, request: Request):
     return BatchResponse(results=results)
 
 
-@app.get("/models")
+@app.get("/models", tags=["system"])
 async def list_models():
     """List available language models with their descriptions.
 
@@ -1181,7 +1228,7 @@ class EvalSummaryResponse(BaseModel):
     test_tokens: int
 
 
-@app.get("/eval/summary", response_model=EvalSummaryResponse)
+@app.get("/eval/summary", response_model=EvalSummaryResponse, tags=["evaluation"])
 async def eval_summary():
     """Run a fast side-by-side evaluation on the sample corpus.
 
@@ -1329,7 +1376,7 @@ def _neural_generate(neural_model, start_word, max_length, temperature, seed):
     return " ".join(words)
 
 
-@app.post("/generate", response_model=GenerateResponse)
+@app.post("/generate", response_model=GenerateResponse, tags=["prediction"])
 async def generate_text(req: GenerateRequest):
     """Generate text using the selected language model.
 
@@ -1381,7 +1428,7 @@ async def generate_text(req: GenerateRequest):
     )
 
 
-@app.get("/metrics")
+@app.get("/metrics", tags=["observability"])
 async def metrics():
     """Get API usage metrics (hand-rolled JSON format).
 
@@ -1403,7 +1450,7 @@ async def metrics():
     }
 
 
-@app.get("/vocab/stats")
+@app.get("/vocab/stats", tags=["system"])
 async def vocab_stats():
     """Get vocabulary statistics for the trained models.
 
